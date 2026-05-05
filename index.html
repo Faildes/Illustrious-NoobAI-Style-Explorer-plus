@@ -14,7 +14,7 @@
     <title>Illustrious XL &amp; NoobAI-XL Style Explorer | 16,000+ Danbooru Artist Styles</title>
     <meta name="description" content="Visual database of 16,000+ Danbooru artist styles for the popular Illustrious XL and NoobAI-XL models. Browse high-quality previews, compare artist influence, check dataset strength, and copy optimized prompts for Stable Diffusion, ComfyUI, and Forge. Perfect for both models.">
     <meta name="keywords" content="Illustrious XL, NoobAI-XL, NAI-XL, Illustrious XL artist styles, NoobAI-XL prompts, Danbooru artist styles, Danbooru tags, Stable Diffusion XL, anime AI art, AI artist library, Laxhar Lab, OnomaAI, SDXL prompts">
-    <link rel="stylesheet" href="app/style.css?v=4">
+    <link rel="stylesheet" href="app/style.css?v=5">
     
     <meta property="og:title" content="Illustrious XL &amp; NoobAI-XL Style Explorer — 16,000+ Danbooru Artist Styles">
     <meta property="og:description" content="Explore 16,000+ Danbooru artist styles that work perfectly in both the massively popular Illustrious XL and its powerful fine-tune NoobAI-XL. Instant visual previews and one-click prompts.">
@@ -102,6 +102,13 @@
                     <div class="style-tool-row">
                         <label class="visually-hidden" for="random-style-count">Number of random styles</label>
                         <input type="number" id="random-style-count" class="style-tool-input" min="1" max="200" value="4" title="Number of styles to output">
+                        <select id="random-strength-preset" class="style-tool-select" title="Strength preset for random output">
+                            <option value="raw">Raw</option>
+                            <option value="light">Light</option>
+                            <option value="normal">Normal</option>
+                            <option value="strong">Strong</option>
+                            <option value="auto">Auto by entries</option>
+                        </select>
                         <button id="get-random-style-btn" class="sort-button style-tool-button" title="Get random styles">Get Random Style</button>
                         <button id="copy-random-style-btn" class="sort-button style-tool-button compact" title="Copy random styles">Copy</button>
                     </div>
@@ -111,8 +118,8 @@
                 <section class="style-tool-card similar-style-tool" aria-labelledby="similar-style-title">
                     <div class="style-tool-header" id="similar-style-title">Similar Style Search</div>
                     <div class="style-tool-row">
-                        <input type="file" id="similar-style-input" accept="image/*" style="display: none;">
-                        <button id="similar-style-upload-btn" class="sort-button style-tool-button" title="Search styles visually similar to an uploaded image">Choose Image</button>
+                        <input type="file" id="similar-style-input" accept="image/*" multiple style="display: none;">
+                        <button id="similar-style-upload-btn" class="sort-button style-tool-button" title="Search styles visually similar to one or more uploaded images">Choose Images</button>
                         <button id="stop-similar-style-btn" class="sort-button style-tool-button compact danger" title="Stop and rank already analyzed styles" style="display: none;">Stop</button>
                         <button id="clear-similar-style-btn" class="sort-button style-tool-button compact" title="Clear similar style search" style="display: none;">Clear</button>
                     </div>
@@ -126,12 +133,106 @@
                             Parallel
                             <input type="number" id="similar-style-concurrency" class="style-tool-input small" min="4" max="128" step="1" value="48">
                         </label>
+                        <label class="similar-style-option" title="How multiple uploaded reference images are combined.">
+                            Match
+                            <select id="similar-style-match-mode" class="style-tool-select small">
+                                <option value="common">Common</option>
+                                <option value="average">Average</option>
+                                <option value="any">Any</option>
+                            </select>
+                        </label>
+                        <label class="similar-style-option" title="Filter similarity results by visual cluster.">
+                            Cluster
+                            <select id="similar-style-cluster-filter" class="style-tool-select small">
+                                <option value="all">All</option>
+                            </select>
+                        </label>
                     </div>
                     <div id="similar-style-progress" class="similar-style-progress" aria-hidden="true">
                         <div id="similar-style-progress-fill" class="similar-style-progress-fill"></div>
                     </div>
-                    <div id="similar-style-status" class="similar-style-status">Upload an image to rank styles by visual similarity.</div>
+                    <div id="similar-style-status" class="similar-style-status">Upload one or more images to rank styles by visual similarity. Color and monochrome cues are both analyzed.</div>
                 </section>
+
+                <details id="advanced-style-tools" class="style-tool-card advanced-style-tools" open>
+                    <summary class="style-tool-header">Advanced Style Tools</summary>
+                    <div class="advanced-tools-grid">
+                        <section class="advanced-tool-section" aria-labelledby="mix-builder-title">
+                            <h3 id="mix-builder-title">Style Mix Builder</h3>
+                            <div class="style-tool-row">
+                                <select id="mix-strength-preset" class="style-tool-select" title="Strength preset for selected styles">
+                                    <option value="raw">Raw</option>
+                                    <option value="light">Light</option>
+                                    <option value="normal">Normal</option>
+                                    <option value="strong">Strong</option>
+                                    <option value="auto">Auto by entries</option>
+                                </select>
+                                <button id="copy-mix-btn" class="sort-button style-tool-button compact">Copy Mix</button>
+                                <button id="clear-mix-btn" class="sort-button style-tool-button compact">Clear</button>
+                            </div>
+                            <textarea id="style-mix-output" class="style-tool-textarea" rows="3" readonly placeholder="Use the Mix button on cards to build a style blend."></textarea>
+                            <div id="style-mix-status" class="advanced-tool-status">0 styles selected.</div>
+                        </section>
+
+                        <section class="advanced-tool-section" aria-labelledby="bulk-copy-title">
+                            <h3 id="bulk-copy-title">Bulk Copy / Template</h3>
+                            <div class="style-tool-row">
+                                <input type="number" id="bulk-copy-count" class="style-tool-input small" min="1" max="200" value="10" title="Number of visible results to copy">
+                                <button id="copy-top-results-btn" class="sort-button style-tool-button compact">Copy Top</button>
+                                <button id="copy-visible-results-btn" class="sort-button style-tool-button compact">Copy Visible</button>
+                            </div>
+                            <textarea id="prompt-template-input" class="style-tool-textarea" rows="2" placeholder="Prompt template. Use {styles}, {style}, {style_list}, or {weighted_styles}.">masterpiece, best quality, {styles}</textarea>
+                            <div class="style-tool-row">
+                                <button id="apply-template-btn" class="sort-button style-tool-button compact">Apply Template</button>
+                                <button id="save-template-btn" class="sort-button style-tool-button compact">Save Template</button>
+                            </div>
+                            <textarea id="prompt-template-output" class="style-tool-textarea" rows="3" readonly placeholder="Template output appears here."></textarea>
+                        </section>
+
+                        <section class="advanced-tool-section" aria-labelledby="exclude-title">
+                            <h3 id="exclude-title">Exclude Styles</h3>
+                            <div class="style-tool-row">
+                                <input type="text" id="exclude-style-input" class="style-tool-input wide" placeholder="Artist name or part of name">
+                                <button id="add-exclude-btn" class="sort-button style-tool-button compact">Exclude</button>
+                                <button id="clear-exclude-btn" class="sort-button style-tool-button compact danger">Clear</button>
+                            </div>
+                            <div id="exclude-status" class="advanced-tool-status">0 excluded styles.</div>
+                        </section>
+
+                        <section class="advanced-tool-section" aria-labelledby="favorite-tags-title">
+                            <h3 id="favorite-tags-title">Favorite Tags</h3>
+                            <div class="style-tool-row">
+                                <input type="text" id="favorite-tag-input" class="style-tool-input wide" placeholder="tag1, tag2">
+                                <button id="add-tag-to-mix-btn" class="sort-button style-tool-button compact">Tag Mix</button>
+                                <select id="favorite-tag-filter" class="style-tool-select">
+                                    <option value="all">All tags</option>
+                                </select>
+                            </div>
+                            <div id="favorite-tag-status" class="advanced-tool-status">Tags are saved locally for favorite styles.</div>
+                        </section>
+
+                        <section class="advanced-tool-section" aria-labelledby="compare-history-title">
+                            <h3 id="compare-history-title">Compare / History</h3>
+                            <div class="style-tool-row">
+                                <button id="open-compare-btn" class="sort-button style-tool-button compact">Compare</button>
+                                <button id="clear-compare-btn" class="sort-button style-tool-button compact">Clear Compare</button>
+                                <button id="open-history-btn" class="sort-button style-tool-button compact">History</button>
+                                <button id="clear-history-btn" class="sort-button style-tool-button compact danger">Clear History</button>
+                            </div>
+                            <div id="compare-status" class="advanced-tool-status">0 / 4 comparison slots used.</div>
+                        </section>
+
+                        <section class="advanced-tool-section" aria-labelledby="cache-title">
+                            <h3 id="cache-title">Similarity Cache</h3>
+                            <div class="style-tool-row">
+                                <button id="cache-info-btn" class="sort-button style-tool-button compact">Info</button>
+                                <button id="build-cache-btn" class="sort-button style-tool-button compact">Build Missing</button>
+                                <button id="clear-cache-btn" class="sort-button style-tool-button compact danger">Clear Cache</button>
+                            </div>
+                            <div id="cache-status" class="advanced-tool-status">Cache info not loaded.</div>
+                        </section>
+                    </div>
+                </details>
             </div>
             <div id="swipe-continue-hint" class="hotkey-hint" style="display: none;" title="Jump to this artist in the main gallery">
                 Middle-click a card to find in gallery
@@ -211,9 +312,26 @@
         <div class="swipe-hint">Use <kbd>←</kbd> <kbd>→</kbd> to navigate, <kbd>C</kbd> to copy name, <kbd>↓</kbd> to favorite, <kbd>Esc</kbd> to close</div>
     </div>
 
-    <script src="app/data.js?v=4"></script>
-    <script src="app/app.js?v=4"></script>
-    <script src="app/swipe-mode.js?v=4"></script>
-    <script src="app/folders.js?v=4"></script>
+
+    <div id="compare-modal" class="advanced-modal" aria-hidden="true">
+        <div class="advanced-modal-content wide">
+            <button id="compare-modal-close" class="advanced-modal-close" title="Close">&times;</button>
+            <h2>Style Compare</h2>
+            <div id="compare-modal-grid" class="compare-modal-grid"></div>
+        </div>
+    </div>
+
+    <div id="history-modal" class="advanced-modal" aria-hidden="true">
+        <div class="advanced-modal-content">
+            <button id="history-modal-close" class="advanced-modal-close" title="Close">&times;</button>
+            <h2>Style History</h2>
+            <div id="history-modal-list" class="history-modal-list"></div>
+        </div>
+    </div>
+
+    <script src="app/data.js?v=5"></script>
+    <script src="app/app.js?v=5"></script>
+    <script src="app/swipe-mode.js?v=5"></script>
+    <script src="app/folders.js?v=5"></script>
 </body>
 </html>

@@ -74,10 +74,10 @@
     const similarityFeatureCache = new Map();
     let pendingSimilarityFeatureSaves = [];
     let pendingSimilarityFeatureSaveTimer = null;
-    const SIMILARITY_CANVAS_SIZE = 48;
-    const SIMILARITY_GRID_SIZE = 6;
+    const SIMILARITY_CANVAS_SIZE = 64;
+    const SIMILARITY_GRID_SIZE = 8;
     const SIMILARITY_FEATURE_STORE_NAME = 'similarity_features';
-    const SIMILARITY_FEATURE_VERSION = `v4-${SIMILARITY_CANVAS_SIZE}-${SIMILARITY_GRID_SIZE}`;
+    const SIMILARITY_FEATURE_VERSION = `v6-style-cues-${SIMILARITY_CANVAS_SIZE}-${SIMILARITY_GRID_SIZE}`;
     const SIMILARITY_MIN_CONCURRENCY = 4;
     const SIMILARITY_MAX_CONCURRENCY = 128;
     const SIMILARITY_DEFAULT_CONCURRENCY = Math.min(96, Math.max(16, (navigator.hardwareConcurrency || 8) * 6));
@@ -127,7 +127,7 @@
 
     function initDB() {
         return new Promise((resolve, reject) => {
-            const request = indexedDB.open(DB_NAME, 5); // Увеличиваем версию для обновления схемы
+            const request = indexedDB.open(DB_NAME, 6); // Увеличиваем версию для обновления схемы
 
             request.onerror = () => {
                 console.error('IndexedDB error:', request.error);
@@ -1681,9 +1681,9 @@
         });
 
         similarStyleInput.addEventListener('change', (event) => {
-            const file = event.target.files?.[0];
-            if (file) {
-                runSimilarStyleSearch(file);
+            const files = Array.from(event.target.files || []);
+            if (files.length) {
+                runSimilarStyleSearch(files);
             }
         });
     }
@@ -2416,14 +2416,1116 @@
         }
     }
 
+
+
+    // --- Advanced Style Explorer tools and enhanced visual matching ---
+    const ADVANCED_KEYS = {
+        mix: 'advancedStyleMixIds',
+        compare: 'advancedStyleCompareIds',
+        excluded: 'advancedExcludedStyleIds',
+        tags: 'advancedFavoriteTags',
+        history: 'advancedStyleHistory',
+        template: 'advancedPromptTemplate'
+    };
+    const ADVANCED_HISTORY_LIMIT = 80;
+    const mixSelectedIds = new Set(loadAdvancedArray(ADVANCED_KEYS.mix));
+    const compareSelectedIds = new Set(loadAdvancedArray(ADVANCED_KEYS.compare).slice(0, 4));
+    const excludedStyleIds = new Set(loadAdvancedArray(ADVANCED_KEYS.excluded));
+    let favoriteTagsById = loadAdvancedObject(ADVANCED_KEYS.tags);
+    let styleHistory = loadAdvancedArray(ADVANCED_KEYS.history);
+
+    function byId(id) { return document.getElementById(id); }
+
+    function loadAdvancedArray(key) {
+        try {
+            const value = JSON.parse(localStorage.getItem(key) || '[]');
+            return Array.isArray(value) ? value : [];
+        } catch (_) {
+            return [];
+        }
+    }
+
+    function loadAdvancedObject(key) {
+        try {
+            const value = JSON.parse(localStorage.getItem(key) || '{}');
+            return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+        } catch (_) {
+            return {};
+        }
+    }
+
+    function saveAdvancedArray(key, value) {
+        localStorage.setItem(key, JSON.stringify(Array.from(value)));
+    }
+
+    function saveAdvancedObject(key, value) {
+        localStorage.setItem(key, JSON.stringify(value));
+    }
+
+    function getItemById(id) {
+        const targetId = String(id);
+        return (currentItems || []).find(item => item.id === targetId)
+            || (similarityItems || []).find(item => item.id === targetId)
+            || allItems.find(item => item.id === targetId);
+    }
+
+    function getVisibleSourceItems() {
+        const items = currentItems && currentItems.length ? currentItems : (similarityModeActive && similarityItems.length ? similarityItems : allItems);
+        return items.filter(item => item && !excludedStyleIds.has(item.id) && passesFavoriteTagFilter(item));
+    }
+
+    function getFavoriteTags(itemOrId) {
+        const id = typeof itemOrId === 'object' ? itemOrId.id : String(itemOrId);
+        const tags = favoriteTagsById[id];
+        return Array.isArray(tags) ? tags : [];
+    }
+
+    function setFavoriteTags(id, tags) {
+        const normalized = Array.from(new Set((tags || [])
+            .map(tag => String(tag).trim().toLowerCase())
+            .filter(Boolean))).slice(0, 12);
+        if (normalized.length) favoriteTagsById[id] = normalized;
+        else delete favoriteTagsById[id];
+        saveAdvancedObject(ADVANCED_KEYS.tags, favoriteTagsById);
+        updateFavoriteTagOptions();
+    }
+
+    function getSelectedMixItems() {
+        return Array.from(mixSelectedIds).map(getItemById).filter(Boolean).filter(item => !excludedStyleIds.has(item.id));
+    }
+
+    function getCompareItems() {
+        return Array.from(compareSelectedIds).map(getItemById).filter(Boolean);
+    }
+
+    function getStrengthPreset(selectId, fallback = 'raw') {
+        return byId(selectId)?.value || fallback;
+    }
+
+    function getAutoStyleWeight(item) {
+        const maxWorks = Math.max(1, ...allItems.map(entry => Number(entry.worksCount) || 0));
+        const count = Math.max(0, Number(item?.worksCount) || 0);
+        const popularity = Math.log(count + 1) / Math.log(maxWorks + 1);
+        const weight = 1.5 - (popularity * 1.4);
+        return Math.max(0.1, Math.min(1.5, Number(weight.toFixed(2))));
+    }
+
+    function formatWeight(value) {
+        return Number(value).toFixed(2).replace(/\.00$/, '').replace(/0$/, '');
+    }
+
+    function formatStyleWithPreset(item, preset = 'raw') {
+        if (!item) return '';
+        const name = item.artist;
+        if (preset === 'light') return `(${name}:0.6)`;
+        if (preset === 'normal') return `(${name}:1)`;
+        if (preset === 'strong') return `(${name}:1.25)`;
+        if (preset === 'auto') return `(${name}:${formatWeight(getAutoStyleWeight(item))})`;
+        return name;
+    }
+
+    function formatStyleList(items, preset = 'raw') {
+        return items.map(item => formatStyleWithPreset(item, preset)).join(', ');
+    }
+
+    function addHistoryEntry(type, text, meta = {}) {
+        if (!text) return;
+        styleHistory.unshift({
+            type,
+            text,
+            meta,
+            timestamp: Date.now()
+        });
+        styleHistory = styleHistory.slice(0, ADVANCED_HISTORY_LIMIT);
+        localStorage.setItem(ADVANCED_KEYS.history, JSON.stringify(styleHistory));
+    }
+
+    function copyTextWithHistory(text, toastMessage, historyType = 'copy', meta = {}) {
+        if (!text) {
+            showToast('Nothing to copy.');
+            return;
+        }
+        navigator.clipboard.writeText(text).then(() => {
+            addHistoryEntry(historyType, text, meta);
+            showToast(toastMessage || 'Copied to clipboard!');
+        }).catch(() => showToast('Could not copy to clipboard.'));
+    }
+
+    function updateMixOutput() {
+        const output = byId('style-mix-output');
+        const status = byId('style-mix-status');
+        const preset = getStrengthPreset('mix-strength-preset');
+        const selected = getSelectedMixItems();
+        if (output) output.value = formatStyleList(selected, preset);
+        if (status) {
+            const autoText = preset === 'auto' ? ' Auto weights use post-count rarity: popular styles go lower, rare styles go higher within 0.1–1.5.' : '';
+            status.textContent = `${selected.length} style${selected.length === 1 ? '' : 's'} selected.${autoText}`;
+        }
+        saveAdvancedArray(ADVANCED_KEYS.mix, mixSelectedIds);
+        refreshCardStateClasses();
+    }
+
+    function updateCompareStatus() {
+        const status = byId('compare-status');
+        if (status) status.textContent = `${compareSelectedIds.size} / 4 comparison slots used.`;
+        saveAdvancedArray(ADVANCED_KEYS.compare, compareSelectedIds);
+        refreshCardStateClasses();
+    }
+
+    function updateExcludeStatus() {
+        const status = byId('exclude-status');
+        if (status) status.textContent = `${excludedStyleIds.size.toLocaleString('en-US')} excluded style${excludedStyleIds.size === 1 ? '' : 's'}. Excluded styles are skipped by random output and similarity search.`;
+        saveAdvancedArray(ADVANCED_KEYS.excluded, excludedStyleIds);
+        refreshCardStateClasses();
+    }
+
+    function updateFavoriteTagOptions() {
+        const select = byId('favorite-tag-filter');
+        if (!select) return;
+        const current = select.value || 'all';
+        const tags = Array.from(new Set(Object.values(favoriteTagsById).flat().filter(Boolean))).sort((a, b) => a.localeCompare(b));
+        select.innerHTML = '<option value="all">All tags</option>' + tags.map(tag => `<option value="${escapeHtml(tag)}">${escapeHtml(tag)}</option>`).join('');
+        select.value = tags.includes(current) ? current : 'all';
+        updateFavoriteTagStatus();
+    }
+
+    function updateFavoriteTagStatus() {
+        const status = byId('favorite-tag-status');
+        if (!status) return;
+        const tagCount = new Set(Object.values(favoriteTagsById).flat().filter(Boolean)).size;
+        const artistCount = Object.keys(favoriteTagsById).length;
+        status.textContent = `${tagCount} tag${tagCount === 1 ? '' : 's'} on ${artistCount} style${artistCount === 1 ? '' : 's'}.`;
+    }
+
+    function passesFavoriteTagFilter(item) {
+        const select = byId('favorite-tag-filter');
+        const filter = select?.value || 'all';
+        if (currentView !== 'favorites' || filter === 'all') return true;
+        return getFavoriteTags(item).includes(filter);
+    }
+
+    function refreshCardStateClasses() {
+        galleryContainer.querySelectorAll('.card').forEach(card => {
+            const id = card.dataset.id;
+            const item = getItemById(id);
+            card.classList.toggle('in-mix', mixSelectedIds.has(id));
+            card.classList.toggle('in-compare', compareSelectedIds.has(id));
+            card.classList.toggle('is-excluded', excludedStyleIds.has(id));
+            card.classList.toggle('tag-filter-hidden', item ? !passesFavoriteTagFilter(item) : false);
+            const mixBtn = card.querySelector('.card-action-button.mix');
+            const compareBtn = card.querySelector('.card-action-button.compare');
+            if (mixBtn) mixBtn.classList.toggle('active', mixSelectedIds.has(id));
+            if (compareBtn) compareBtn.classList.toggle('active', compareSelectedIds.has(id));
+        });
+    }
+
+    function toggleMixItem(item) {
+        if (mixSelectedIds.has(item.id)) mixSelectedIds.delete(item.id);
+        else mixSelectedIds.add(item.id);
+        updateMixOutput();
+        showToast(mixSelectedIds.has(item.id) ? 'Added to style mix.' : 'Removed from style mix.');
+    }
+
+    function toggleCompareItem(item) {
+        if (compareSelectedIds.has(item.id)) {
+            compareSelectedIds.delete(item.id);
+        } else {
+            if (compareSelectedIds.size >= 4) {
+                showToast('Compare mode supports up to 4 styles.');
+                return;
+            }
+            compareSelectedIds.add(item.id);
+        }
+        updateCompareStatus();
+    }
+
+    function excludeItem(item) {
+        excludedStyleIds.add(item.id);
+        mixSelectedIds.delete(item.id);
+        compareSelectedIds.delete(item.id);
+        updateExcludeStatus();
+        updateMixOutput();
+        updateCompareStatus();
+        if (similarityModeActive && !similaritySearchInProgress) applySimilarityThresholdAndRender(true);
+        showToast('Style excluded.');
+    }
+
+    function addTagsToItem(item) {
+        if (!favorites.has(item.id)) {
+            showToast('Add this style to Favorites before tagging it.');
+            return;
+        }
+        const current = getFavoriteTags(item).join(', ');
+        const next = prompt(`Tags for ${item.artist}:`, current);
+        if (next === null) return;
+        const tags = next.split(',').map(tag => tag.trim()).filter(Boolean);
+        setFavoriteTags(item.id, tags);
+        renderView();
+        showToast('Favorite tags updated.');
+    }
+
+    function addTagsToMixSelection() {
+        const tagInput = byId('favorite-tag-input');
+        const tags = (tagInput?.value || '').split(',').map(tag => tag.trim()).filter(Boolean);
+        if (!tags.length) {
+            showToast('Enter at least one tag.');
+            return;
+        }
+        const selected = getSelectedMixItems().filter(item => favorites.has(item.id));
+        if (!selected.length) {
+            showToast('Select favorite styles in Mix first.');
+            return;
+        }
+        selected.forEach(item => setFavoriteTags(item.id, Array.from(new Set([...getFavoriteTags(item), ...tags]))));
+        if (tagInput) tagInput.value = '';
+        renderView();
+        showToast(`Tagged ${selected.length} favorite style${selected.length === 1 ? '' : 's'}.`);
+    }
+
+    function showCompareModal() {
+        const modal = byId('compare-modal');
+        const grid = byId('compare-modal-grid');
+        if (!modal || !grid) return;
+        const items = getCompareItems();
+        if (!items.length) {
+            showToast('Use Compare on cards first.');
+            return;
+        }
+        grid.innerHTML = items.map(item => {
+            const tags = getFavoriteTags(item);
+            const similarity = typeof item.similarityScore === 'number' ? `<div>Similarity: ${item.similarityPercent || formatSimilarityPercent(item.similarityScore)}</div>` : '';
+            const cluster = item.similarityCluster ? `<div>Cluster: ${escapeHtml(item.similarityCluster)}</div>` : '';
+            return `<article class="compare-card">
+                <img src="${item.image}" alt="${escapeHtml(item.artist)}">
+                <div class="compare-card-info">
+                    <strong>${escapeHtml(item.artist)}</strong>
+                    <div>Works: ${Number(item.worksCount || 0).toLocaleString('en-US')}</div>
+                    <div>Auto strength: ${formatWeight(getAutoStyleWeight(item))}</div>
+                    <div>Uniqueness: ${Number(item.uniqueness_score || 0).toFixed(2)}</div>
+                    ${similarity}${cluster}
+                    ${tags.length ? `<div>Tags: ${tags.map(escapeHtml).join(', ')}</div>` : ''}
+                </div>
+            </article>`;
+        }).join('');
+        modal.classList.add('visible');
+        modal.setAttribute('aria-hidden', 'false');
+    }
+
+    function closeCompareModal() {
+        const modal = byId('compare-modal');
+        if (modal) {
+            modal.classList.remove('visible');
+            modal.setAttribute('aria-hidden', 'true');
+        }
+    }
+
+    function showHistoryModal() {
+        const modal = byId('history-modal');
+        const list = byId('history-modal-list');
+        if (!modal || !list) return;
+        if (!styleHistory.length) {
+            list.innerHTML = '<p class="advanced-tool-status">No history yet.</p>';
+        } else {
+            list.innerHTML = styleHistory.map(entry => {
+                const date = new Date(entry.timestamp).toLocaleString();
+                return `<div class="history-item"><strong>${escapeHtml(entry.type)} · ${escapeHtml(date)}</strong><code>${escapeHtml(entry.text)}</code></div>`;
+            }).join('');
+        }
+        modal.classList.add('visible');
+        modal.setAttribute('aria-hidden', 'false');
+    }
+
+    function closeHistoryModal() {
+        const modal = byId('history-modal');
+        if (modal) {
+            modal.classList.remove('visible');
+            modal.setAttribute('aria-hidden', 'true');
+        }
+    }
+
+    function rgbToHsv(r, g, b) {
+        r /= 255; g /= 255; b /= 255;
+        const max = Math.max(r, g, b), min = Math.min(r, g, b);
+        const d = max - min;
+        let h = 0;
+        if (d !== 0) {
+            if (max === r) h = ((g - b) / d) % 6;
+            else if (max === g) h = (b - r) / d + 2;
+            else h = (r - g) / d + 4;
+            h /= 6;
+            if (h < 0) h += 1;
+        }
+        const s = max === 0 ? 0 : d / max;
+        return [h, s, max];
+    }
+
+    function normalizeVectorPart(values, weight = 1) {
+        const sum = values.reduce((a, b) => a + Math.abs(b), 0) || 1;
+        return values.map(v => (v / sum) * weight);
+    }
+
+    function extractImageFeature(img) {
+        const canvas = document.createElement('canvas');
+        canvas.width = SIMILARITY_CANVAS_SIZE;
+        canvas.height = SIMILARITY_CANVAS_SIZE;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0, SIMILARITY_CANVAS_SIZE, SIMILARITY_CANVAS_SIZE);
+        const { data } = ctx.getImageData(0, 0, SIMILARITY_CANVAS_SIZE, SIMILARITY_CANVAS_SIZE);
+        const w = SIMILARITY_CANVAS_SIZE;
+        const h = SIMILARITY_CANVAS_SIZE;
+        const pixelCount = w * h;
+        const luma = new Float32Array(pixelCount);
+        const hueHist = new Array(12).fill(0);
+        const satHist = new Array(8).fill(0);
+        const valHist = new Array(8).fill(0);
+        const lumaHist = new Array(10).fill(0);
+        const edgeOrient = new Array(8).fill(0);
+        const edgeGrid = new Array(SIMILARITY_GRID_SIZE * SIMILARITY_GRID_SIZE).fill(0);
+        const eyeShape = new Array(16).fill(0);
+        const faceLuma = new Array(16).fill(0);
+        const colorVarianceGrid = new Array(16).fill(0);
+        const gridCounts4 = new Array(16).fill(0);
+        let satSum = 0, valueSum = 0, lumaSum = 0, darkInk = 0, flatColorPixels = 0;
+
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                const p = y * w + x;
+                const i = p * 4;
+                const alpha = data[i + 3] / 255;
+                const r = data[i] * alpha + 28 * (1 - alpha);
+                const g = data[i + 1] * alpha + 28 * (1 - alpha);
+                const b = data[i + 2] * alpha + 30 * (1 - alpha);
+                const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+                const [hh, ss, vv] = rgbToHsv(r, g, b);
+                luma[p] = lum;
+                hueHist[Math.min(11, Math.floor(hh * 12))] += ss > 0.08 ? 1 : 0.2;
+                satHist[Math.min(7, Math.floor(ss * 8))]++;
+                valHist[Math.min(7, Math.floor(vv * 8))]++;
+                lumaHist[Math.min(9, Math.floor(lum * 10))]++;
+                satSum += ss;
+                valueSum += vv;
+                lumaSum += lum;
+                if (lum < 0.22 && ss < 0.45) darkInk++;
+                const gx4 = Math.min(3, Math.floor(x / (w / 4)));
+                const gy4 = Math.min(3, Math.floor(y / (h / 4)));
+                const gi4 = gy4 * 4 + gx4;
+                colorVarianceGrid[gi4] += ss * (1 - Math.abs(vv - 0.55));
+                gridCounts4[gi4]++;
+
+                if (x > 0 && y > 0) {
+                    const prev = ((y - 1) * w + (x - 1)) * 4;
+                    const diff = Math.abs(r - data[prev]) + Math.abs(g - data[prev + 1]) + Math.abs(b - data[prev + 2]);
+                    if (diff < 20) flatColorPixels++;
+                }
+            }
+        }
+
+        let edgeSum = 0, faceEdgeSum = 0, eyeEdgeSum = 0, horizontalEyeEdges = 0, verticalEyeEdges = 0;
+        const gridCell = w / SIMILARITY_GRID_SIZE;
+        for (let y = 1; y < h - 1; y++) {
+            for (let x = 1; x < w - 1; x++) {
+                const p = y * w + x;
+                const gx = (luma[p + 1] - luma[p - 1]) * 0.5;
+                const gy = (luma[p + w] - luma[p - w]) * 0.5;
+                const mag = Math.sqrt(gx * gx + gy * gy);
+                if (mag < 0.018) continue;
+                const angle = (Math.atan2(gy, gx) + Math.PI) / (Math.PI * 2);
+                const bin = Math.min(7, Math.floor(angle * 8));
+                const gridX = Math.min(SIMILARITY_GRID_SIZE - 1, Math.floor(x / gridCell));
+                const gridY = Math.min(SIMILARITY_GRID_SIZE - 1, Math.floor(y / gridCell));
+                edgeOrient[bin] += mag;
+                edgeGrid[gridY * SIMILARITY_GRID_SIZE + gridX] += mag;
+                edgeSum += mag;
+
+                const inFace = x >= w * 0.22 && x <= w * 0.78 && y >= h * 0.12 && y <= h * 0.58;
+                const inEye = x >= w * 0.18 && x <= w * 0.82 && y >= h * 0.18 && y <= h * 0.42;
+                if (inFace) faceEdgeSum += mag;
+                if (inEye) {
+                    eyeEdgeSum += mag;
+                    if (Math.abs(gx) > Math.abs(gy)) verticalEyeEdges += mag;
+                    else horizontalEyeEdges += mag;
+                    const ex = Math.min(3, Math.floor((x - w * 0.18) / (w * 0.64 / 4)));
+                    const ey = Math.min(3, Math.floor((y - h * 0.18) / (h * 0.24 / 4)));
+                    if (ex >= 0 && ey >= 0) eyeShape[ey * 4 + ex] += mag;
+                }
+                if (inFace) {
+                    const fx = Math.min(3, Math.floor((x - w * 0.22) / (w * 0.56 / 4)));
+                    const fy = Math.min(3, Math.floor((y - h * 0.12) / (h * 0.46 / 4)));
+                    if (fx >= 0 && fy >= 0) faceLuma[fy * 4 + fx] += luma[p];
+                }
+            }
+        }
+
+        const avgSat = satSum / pixelCount;
+        const avgValue = valueSum / pixelCount;
+        const avgLuma = lumaSum / pixelCount;
+        const edgeDensity = edgeSum / pixelCount;
+        const inkRatio = darkInk / pixelCount;
+        const flatness = flatColorPixels / pixelCount;
+        const faceEdgeRatio = faceEdgeSum / Math.max(0.0001, edgeSum);
+        const eyeEdgeRatio = eyeEdgeSum / Math.max(0.0001, edgeSum);
+        const eyeAspectCue = horizontalEyeEdges / Math.max(0.0001, verticalEyeEdges + horizontalEyeEdges);
+        const localColorVar = colorVarianceGrid.map((v, i) => v / Math.max(1, gridCounts4[i]));
+
+        const feature = [];
+        feature.push(...normalizeVectorPart(hueHist, 1.15));
+        feature.push(...normalizeVectorPart(satHist, 0.85));
+        feature.push(...normalizeVectorPart(valHist, 0.75));
+        feature.push(...normalizeVectorPart(lumaHist, 0.9));
+        feature.push(...normalizeVectorPart(edgeOrient, 1.35));
+        feature.push(...normalizeVectorPart(edgeGrid, 1.6));
+        feature.push(...normalizeVectorPart(eyeShape, 2.1));
+        feature.push(...normalizeVectorPart(faceLuma, 1.45));
+        feature.push(...normalizeVectorPart(localColorVar, 0.95));
+        feature.push(avgSat * 0.9, avgValue * 0.55, avgLuma * 0.55, edgeDensity * 4.0, inkRatio * 1.7, flatness * 0.7, faceEdgeRatio * 1.3, eyeEdgeRatio * 1.9, eyeAspectCue * 1.3);
+        const typed = Float32Array.from(feature);
+        typed._styleMeta = {
+            avgSat,
+            avgValue,
+            avgLuma,
+            edgeDensity,
+            inkRatio,
+            flatness,
+            faceEdgeRatio,
+            eyeEdgeRatio,
+            eyeAspectCue,
+            cluster: classifyStyleMeta({ avgSat, avgValue, avgLuma, edgeDensity, inkRatio, flatness, faceEdgeRatio, eyeEdgeRatio, eyeAspectCue })
+        };
+        return typed;
+    }
+
+    function classifyStyleMeta(meta = {}) {
+        const highLine = meta.edgeDensity > 0.052 || meta.inkRatio > 0.12;
+        const softLine = meta.edgeDensity < 0.032 && meta.flatness > 0.18;
+        const vivid = meta.avgSat > 0.42;
+        const muted = meta.avgSat < 0.24;
+        const eyeFocus = meta.eyeEdgeRatio > 0.19 || meta.faceEdgeRatio > 0.38;
+        const bright = meta.avgValue > 0.68;
+        if (eyeFocus && highLine && vivid) return 'eye-focused vivid lineart';
+        if (eyeFocus && muted) return 'face/eye-focused muted';
+        if (highLine && muted) return 'monochrome / ink lineart';
+        if (highLine && vivid) return 'sharp colorful lineart';
+        if (softLine && vivid) return 'soft vivid painting';
+        if (softLine && muted) return 'soft muted painting';
+        if (bright && vivid) return 'bright saturated coloring';
+        if (muted) return 'low-saturation soft tone';
+        return 'balanced anime style';
+    }
+
+    function scoreStyleAgainstQueries(queryFeatures, styleFeature) {
+        const scores = queryFeatures.map(queryFeature => cosineSimilarity(queryFeature, styleFeature));
+        scores.sort((a, b) => a - b);
+        const min = scores[0] || 0;
+        const max = scores[scores.length - 1] || 0;
+        const avg = scores.reduce((a, b) => a + b, 0) / Math.max(1, scores.length);
+        const median = scores[Math.floor(scores.length / 2)] || avg;
+        const mode = byId('similar-style-match-mode')?.value || 'common';
+        const raw = mode === 'any'
+            ? max
+            : mode === 'average'
+                ? avg
+                : (avg * 0.50 + min * 0.38 + median * 0.12);
+        // Calibrate cosine similarity into a more useful 0-1 percentage range.
+        return Math.max(0, Math.min(1, Math.pow(Math.max(0, (raw - 0.52) / 0.48), 0.82)));
+    }
+
+    function readStyleFeatureFromDB(id) {
+        return new Promise(resolve => {
+            if (!db || !db.objectStoreNames.contains(SIMILARITY_FEATURE_STORE_NAME)) {
+                resolve(null);
+                return;
+            }
+            const transaction = db.transaction(SIMILARITY_FEATURE_STORE_NAME, 'readonly');
+            const store = transaction.objectStore(SIMILARITY_FEATURE_STORE_NAME);
+            const request = store.get(id);
+            request.onsuccess = () => {
+                const record = request.result;
+                if (record && record.version === SIMILARITY_FEATURE_VERSION && Array.isArray(record.feature)) {
+                    const feature = Float32Array.from(record.feature);
+                    feature._styleMeta = record.meta || null;
+                    resolve(feature);
+                } else {
+                    resolve(null);
+                }
+            };
+            request.onerror = () => resolve(null);
+        });
+    }
+
+    function queueStyleFeatureSave(id, feature) {
+        if (!db || !db.objectStoreNames.contains(SIMILARITY_FEATURE_STORE_NAME)) return;
+        pendingSimilarityFeatureSaves.push({
+            id,
+            version: SIMILARITY_FEATURE_VERSION,
+            feature: Array.from(feature),
+            meta: feature._styleMeta || null
+        });
+        if (pendingSimilarityFeatureSaves.length >= 250) flushSimilarityFeatureSaves();
+        else if (!pendingSimilarityFeatureSaveTimer) pendingSimilarityFeatureSaveTimer = setTimeout(flushSimilarityFeatureSaves, 1000);
+    }
+
+    async function getStyleFeature(item, token, signal) {
+        if (similarityFeatureCache.has(item.id)) {
+            return { feature: similarityFeatureCache.get(item.id), source: 'memory' };
+        }
+        throwIfSimilarityStopped(token, signal);
+        const dbFeature = await readStyleFeatureFromDB(item.id);
+        if (dbFeature) {
+            similarityFeatureCache.set(item.id, dbFeature);
+            return { feature: dbFeature, source: 'indexeddb' };
+        }
+        throwIfSimilarityStopped(token, signal);
+        const drawable = await loadImageForSimilarity(item.image, true, signal);
+        try {
+            throwIfSimilarityStopped(token, signal);
+            const feature = extractImageFeature(drawable);
+            similarityFeatureCache.set(item.id, feature);
+            queueStyleFeatureSave(item.id, feature);
+            return { feature, source: 'new' };
+        } finally {
+            closeDrawableForSimilarity(drawable);
+        }
+    }
+
+    function getSimilarityClusterFilter() {
+        return byId('similar-style-cluster-filter')?.value || 'all';
+    }
+
+    function buildSimilarityItemsFromResults(rawResults) {
+        const threshold = getSimilarityThreshold();
+        const minimumScore = threshold / 100;
+        const clusterFilter = getSimilarityClusterFilter();
+        return rawResults
+            .filter(result => !excludedStyleIds.has(result.item.id))
+            .filter(result => result.score >= minimumScore)
+            .filter(result => clusterFilter === 'all' || result.cluster === clusterFilter)
+            .sort((a, b) => b.score - a.score)
+            .map((result, index) => ({
+                ...result.item,
+                similarityScore: result.score,
+                similarityPercent: formatSimilarityPercent(result.score),
+                similarityRank: index + 1,
+                similarityCluster: result.cluster || 'balanced anime style'
+            }));
+    }
+
+    function updateSimilarityClusterOptions(rawResults = similarityAllResults) {
+        const select = byId('similar-style-cluster-filter');
+        if (!select) return;
+        const current = select.value || 'all';
+        const clusters = Array.from(new Set(rawResults.map(result => result.cluster).filter(Boolean))).sort((a, b) => a.localeCompare(b));
+        select.innerHTML = '<option value="all">All</option>' + clusters.map(cluster => `<option value="${escapeHtml(cluster)}">${escapeHtml(cluster)}</option>`).join('');
+        select.value = current === 'all' || clusters.includes(current) ? current : 'all';
+    }
+
+    function updateSimilarityResultStatus(stats = similarityLastStats, customMessage = '') {
+        if (!stats) return;
+        const threshold = getSimilarityThreshold();
+        const cluster = getSimilarityClusterFilter();
+        const filteredOut = Math.max(0, similarityAllResults.length - similarityItems.length);
+        const stoppedText = stats.stopped ? 'Stopped. ' : '';
+        const failedText = stats.failed > 0 ? ` · ${stats.failed.toLocaleString('en-US')} skipped` : '';
+        const filteredText = threshold > 0 ? ` · ${filteredOut.toLocaleString('en-US')} below/filter hidden` : (cluster !== 'all' ? ` · ${filteredOut.toLocaleString('en-US')} outside cluster` : '');
+        const cacheText = stats.cached > 0 ? ` · ${stats.cached.toLocaleString('en-US')} cached` : '';
+        const refText = stats.references ? ` · ${stats.references} reference image${stats.references === 1 ? '' : 's'}` : '';
+        const base = customMessage || `${stoppedText}Similar style results: ${similarityItems.length.toLocaleString('en-US')} shown / ${similarityAllResults.length.toLocaleString('en-US')} analyzed${refText}${failedText}${filteredText}${cacheText}.`;
+        setSimilarStyleStatus(base, false);
+    }
+
+    function commitSimilarityResults(rawResults, stats = {}, shouldRender = true) {
+        similarityAllResults = [...rawResults].sort((a, b) => b.score - a.score);
+        updateSimilarityClusterOptions(similarityAllResults);
+        similarityLastStats = {
+            total: stats.total || allItems.length,
+            processed: stats.processed || rawResults.length,
+            failed: stats.failed || 0,
+            cached: stats.cached || 0,
+            stopped: Boolean(stats.stopped),
+            references: stats.references || 1
+        };
+        similarityItems = buildSimilarityItemsFromResults(similarityAllResults);
+        similarityModeActive = true;
+        similaritySearchInProgress = false;
+        similarityStopRequested = false;
+        similarityAbortController = null;
+        if (similarStyleUploadBtn) similarStyleUploadBtn.disabled = false;
+        if (stopSimilarStyleBtn) {
+            stopSimilarStyleBtn.disabled = false;
+            stopSimilarStyleBtn.textContent = 'Stop';
+            stopSimilarStyleBtn.style.display = 'none';
+        }
+        if (clearSimilarStyleBtn) clearSimilarStyleBtn.style.display = 'inline-flex';
+        setSimilarityProgress(similarityLastStats.processed, similarityLastStats.total);
+        styleCounter.innerHTML = `Similar Style Search: <span class="style-count-number">${similarityItems.length.toLocaleString('en-US')}</span>`;
+        updateSimilarityResultStatus();
+        addHistoryEntry('similarity search', similarityItems.slice(0, 20).map(item => `${item.artist} ${item.similarityPercent}`).join(', '), { count: similarityItems.length });
+        updateControlsState();
+        if (shouldRender && currentView === 'gallery') renderView();
+    }
+
+    async function runSimilarStyleSearch(filesOrFile) {
+        const isFileListInput = typeof FileList !== 'undefined' && filesOrFile instanceof FileList;
+        const files = Array.from(isFileListInput ? filesOrFile : (Array.isArray(filesOrFile) ? filesOrFile : [filesOrFile])).filter(Boolean);
+        if (!files.length) return;
+        const invalid = files.find(file => !file.type.startsWith('image/'));
+        if (invalid) {
+            showToast('Please choose image files only.');
+            return;
+        }
+        if (similaritySearchInProgress) stopSimilarStyleSearch();
+        const token = ++similarityAbortToken;
+        similarityAbortController = new AbortController();
+        const signal = similarityAbortController.signal;
+        similarityStopRequested = false;
+        similarityModeActive = false;
+        similaritySearchInProgress = true;
+        similarityItems = [];
+        similarityAllResults = [];
+        similarityLastStats = null;
+        startIndexOffset = 0;
+        searchInput.value = '';
+        searchTerm = '';
+        jumpInput.value = '';
+        clearSearchBtn.style.display = 'none';
+        clearJumpBtn.style.display = 'none';
+        if (clearSimilarStyleBtn) clearSimilarStyleBtn.style.display = 'inline-flex';
+        if (stopSimilarStyleBtn) {
+            stopSimilarStyleBtn.disabled = false;
+            stopSimilarStyleBtn.textContent = 'Stop';
+            stopSimilarStyleBtn.style.display = 'inline-flex';
+        }
+        if (similarStyleUploadBtn) similarStyleUploadBtn.disabled = true;
+        const searchableItems = allItems.filter(item => !excludedStyleIds.has(item.id));
+        setSimilarityProgress(0, searchableItems.length);
+        setSimilarStyleStatus(`Analyzing ${files.length} reference image${files.length === 1 ? '' : 's'}...`, true);
+        updateControlsState();
+        const objectUrls = [];
+        const results = [];
+        const stats = {
+            total: searchableItems.length,
+            processed: 0,
+            failed: 0,
+            cached: 0,
+            extracted: 0,
+            startedAt: performance.now(),
+            stopped: false,
+            references: files.length
+        };
+        try {
+            const queryFeatures = [];
+            for (const file of files) {
+                throwIfSimilarityStopped(token, signal);
+                const url = URL.createObjectURL(file);
+                objectUrls.push(url);
+                const queryImage = await loadImageForSimilarity(url, false, signal);
+                try {
+                    queryFeatures.push(extractImageFeature(queryImage));
+                } finally {
+                    closeDrawableForSimilarity(queryImage);
+                }
+            }
+            let nextIndex = 0;
+            let lastStatusUpdate = 0;
+            const total = searchableItems.length;
+            const workerCount = Math.min(getSimilarityConcurrency(), Math.max(1, total));
+            const updateProgress = (force = false) => {
+                const now = performance.now();
+                if (!force && now - lastStatusUpdate < 140) return;
+                lastStatusUpdate = now;
+                setSimilarityProgress(stats.processed, total);
+                setSimilarStyleStatus(
+                    `Analyzing styles... ${stats.processed.toLocaleString('en-US')} / ${total.toLocaleString('en-US')} · ${formatSimilarityRate(stats.processed, stats.startedAt)} · parallel ${workerCount} · refs ${files.length}`,
+                    true
+                );
+            };
+            async function similarityWorker() {
+                while (token === similarityAbortToken && !similarityStopRequested) {
+                    const index = nextIndex++;
+                    if (index >= total) break;
+                    const item = searchableItems[index];
+                    try {
+                        const { feature, source } = await getStyleFeature(item, token, signal);
+                        throwIfSimilarityStopped(token, signal);
+                        const score = scoreStyleAgainstQueries(queryFeatures, feature);
+                        const meta = feature._styleMeta || {};
+                        results.push({ item, score, cluster: meta.cluster || classifyStyleMeta(meta) });
+                        if (source === 'memory' || source === 'indexeddb') stats.cached++;
+                        else stats.extracted++;
+                    } catch (error) {
+                        if (!similarityStopRequested && token === similarityAbortToken && error?.name !== 'AbortError') stats.failed++;
+                    } finally {
+                        stats.processed++;
+                        updateProgress(false);
+                        if (stats.processed % 96 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+                    }
+                }
+            }
+            await Promise.all(Array.from({ length: workerCount }, () => similarityWorker()));
+            await flushSimilarityFeatureSaves();
+            if (token !== similarityAbortToken) return;
+            stats.stopped = similarityStopRequested;
+            if (!results.length) throw new Error('No preview images could be analyzed. Try using a local web server instead of opening index.html directly.');
+            updateProgress(true);
+            commitSimilarityResults(results, stats, true);
+        } catch (error) {
+            if (token !== similarityAbortToken) return;
+            if (similarityStopRequested && results.length > 0) {
+                stats.stopped = true;
+                commitSimilarityResults(results, stats, true);
+                return;
+            }
+            console.error('Similar Style Search failed:', error);
+            similarityModeActive = false;
+            similaritySearchInProgress = false;
+            similarityItems = [];
+            similarityAllResults = [];
+            similarityLastStats = null;
+            similarityAbortController = null;
+            if (similarStyleUploadBtn) similarStyleUploadBtn.disabled = false;
+            if (stopSimilarStyleBtn) {
+                stopSimilarStyleBtn.disabled = false;
+                stopSimilarStyleBtn.textContent = 'Stop';
+                stopSimilarStyleBtn.style.display = 'none';
+            }
+            setSimilarityProgress(0, 0);
+            setSimilarStyleStatus(error.message || 'Similar Style Search failed.', false);
+            showToast('Similar Style Search failed.');
+            updateControlsState();
+        } finally {
+            objectUrls.forEach(url => URL.revokeObjectURL(url));
+        }
+    }
+
+    function getRandomStyles() {
+        const count = Math.max(1, Math.min(200, parseInt(randomStyleCountInput?.value, 10) || 1));
+        if (randomStyleCountInput) randomStyleCountInput.value = count;
+        const preset = getStrengthPreset('random-strength-preset');
+        const sourceItems = (similarityModeActive && currentView === 'gallery' && similarityItems.length ? similarityItems : allItems)
+            .filter(item => !excludedStyleIds.has(item.id));
+        if (!sourceItems.length) {
+            showToast('No styles available.');
+            return;
+        }
+        const pool = [...sourceItems];
+        shuffleArray(pool);
+        const pickedItems = pool.slice(0, Math.min(count, pool.length));
+        const text = formatStyleList(pickedItems, preset);
+        if (randomStyleOutput) {
+            randomStyleOutput.value = text;
+            randomStyleOutput.focus();
+            randomStyleOutput.select();
+        }
+        addHistoryEntry('random styles', text, { count: pickedItems.length, preset });
+        showToast(`${pickedItems.length} random style${pickedItems.length === 1 ? '' : 's'} generated.`);
+    }
+
+    function createCard(item) {
+        const card = document.createElement('div');
+        card.className = 'card';
+        card.dataset.artist = item.artist;
+        card.draggable = currentView === 'favorites';
+        card.dataset.id = item.id;
+        const isFavorited = favorites.has(item.id);
+        card.classList.toggle('in-mix', mixSelectedIds.has(item.id));
+        card.classList.toggle('in-compare', compareSelectedIds.has(item.id));
+        card.classList.toggle('is-excluded', excludedStyleIds.has(item.id));
+        card.classList.toggle('tag-filter-hidden', !passesFavoriteTagFilter(item));
+        const rankHTML = sortType === 'uniqueness' && item.uniquenessRank
+            ? `<div class="uniqueness-rank" title="Uniqueness Rank">#${item.uniquenessRank}</div>`
+            : '';
+        const similarityHTML = typeof item.similarityScore === 'number'
+            ? `<div class="similarity-score" title="Visual similarity rank and score">#${item.similarityRank} · ${item.similarityPercent || formatSimilarityPercent(item.similarityScore)}</div>`
+            : '';
+        const clusterHTML = item.similarityCluster
+            ? `<div class="similarity-cluster" title="Similarity cluster">${escapeHtml(item.similarityCluster)}</div>`
+            : '';
+        const tags = getFavoriteTags(item);
+        const tagsHTML = tags.length
+            ? `<div class="card-tag-list">${tags.map(tag => `<span class="card-tag-badge">${escapeHtml(tag)}</span>`).join('')}</div>`
+            : '';
+        const favButtonHTML = currentView === 'favorites'
+            ? `<button class="favorite-button remove-favorite" aria-label="Remove from favorites" title="Remove from favorites">×</button>`
+            : `<button class="favorite-button ${isFavorited ? 'favorited' : ''}" aria-label="${isFavorited ? 'Remove from favorites' : 'Add to favorites'}" title="${isFavorited ? 'Remove from favorites' : 'Add to favorites'}"></button>`;
+        const toolsHTML = `<div class="card-tools" aria-label="Card tools">
+            <button class="card-action-button mix ${mixSelectedIds.has(item.id) ? 'active' : ''}" title="Add/remove from Style Mix">Mix</button>
+            <button class="card-action-button compare ${compareSelectedIds.has(item.id) ? 'active' : ''}" title="Add/remove from Compare">Cmp</button>
+            <button class="card-action-button tag" title="Edit favorite tags">Tag</button>
+            <button class="card-action-button exclude" title="Exclude this style from search/random results">Hide</button>
+        </div>`;
+        card.innerHTML = `
+            <img class="card__image" src="${item.image}" alt="${escapeHtml(item.artist)}" loading="lazy" width="832" height="1216">
+            <div class="card__info">
+                <p class="card__artist">${escapeHtml(item.artist)}</p>
+                ${tagsHTML}
+            </div>
+            <div class="works-count" title="Approximate number of training images for this artistic style">${Number(item.worksCount || 0).toLocaleString('en-US')}</div>
+            ${rankHTML}${similarityHTML}${clusterHTML}${toolsHTML}${favButtonHTML}`;
+        card.addEventListener('click', (e) => {
+            if (e.target.closest('.favorite-button') || e.target.closest('.card-action-button') || e.target.closest('.card-tag-badge')) return;
+            if (currentView === 'favorites' && e.ctrlKey) {
+                e.preventDefault();
+                if (selectedArtistIds.has(item.id)) {
+                    selectedArtistIds.delete(item.id);
+                    card.classList.remove('selected');
+                } else {
+                    selectedArtistIds.add(item.id);
+                    card.classList.add('selected');
+                }
+            } else {
+                navigator.clipboard.writeText(item.artist).then(() => {
+                    addHistoryEntry('copied artist', item.artist, { id: item.id });
+                    showToast('Artist name copied to clipboard!');
+                });
+                selectedArtistIds.clear();
+                document.querySelectorAll('.card.selected').forEach(c => c.classList.remove('selected'));
+            }
+        });
+        card.querySelector('.favorite-button').addEventListener('click', (e) => {
+            e.stopPropagation();
+            toggleFavorite(item, e.currentTarget);
+        });
+        card.querySelector('.card-action-button.mix').addEventListener('click', (e) => {
+            e.stopPropagation();
+            toggleMixItem(item);
+        });
+        card.querySelector('.card-action-button.compare').addEventListener('click', (e) => {
+            e.stopPropagation();
+            toggleCompareItem(item);
+        });
+        card.querySelector('.card-action-button.exclude').addEventListener('click', (e) => {
+            e.stopPropagation();
+            excludeItem(item);
+        });
+        card.querySelector('.card-action-button.tag').addEventListener('click', (e) => {
+            e.stopPropagation();
+            addTagsToItem(item);
+        });
+        return card;
+    }
+
+    function applyTemplateToStyles() {
+        const templateInput = byId('prompt-template-input');
+        const output = byId('prompt-template-output');
+        const template = templateInput?.value || '{styles}';
+        const mixItems = getSelectedMixItems();
+        const source = mixItems.length ? mixItems : getVisibleSourceItems().slice(0, Math.max(1, parseInt(byId('bulk-copy-count')?.value, 10) || 1));
+        if (!source.length) {
+            showToast('No styles available for template.');
+            return;
+        }
+        const preset = getStrengthPreset('mix-strength-preset');
+        const rawStyles = source.map(item => item.artist).join(', ');
+        const weightedStyles = formatStyleList(source, preset === 'raw' ? 'auto' : preset);
+        const first = source[0];
+        const rendered = template
+            .replaceAll('{styles}', weightedStyles)
+            .replaceAll('{weighted_styles}', weightedStyles)
+            .replaceAll('{style_list}', rawStyles)
+            .replaceAll('{style}', formatStyleWithPreset(first, preset));
+        if (output) output.value = rendered;
+        addHistoryEntry('prompt template', rendered, { count: source.length });
+        copyTextWithHistory(rendered, 'Template output copied!', 'prompt template', { count: source.length });
+    }
+
+    function copyTopResults(visibleOnly = false) {
+        const count = Math.max(1, Math.min(200, parseInt(byId('bulk-copy-count')?.value, 10) || 10));
+        const preset = getStrengthPreset('mix-strength-preset');
+        const source = visibleOnly
+            ? Array.from(galleryContainer.querySelectorAll('.card:not(.is-excluded):not(.tag-filter-hidden)')).map(card => getItemById(card.dataset.id)).filter(Boolean)
+            : getVisibleSourceItems();
+        const picked = source.slice(0, count);
+        if (!picked.length) {
+            showToast('No visible styles to copy.');
+            return;
+        }
+        copyTextWithHistory(formatStyleList(picked, preset), `Copied top ${picked.length} style${picked.length === 1 ? '' : 's'}!`, 'bulk copy', { count: picked.length, preset });
+    }
+
+    async function countSimilarityFeatureRecords() {
+        if (!db || !db.objectStoreNames.contains(SIMILARITY_FEATURE_STORE_NAME)) return 0;
+        return new Promise(resolve => {
+            const tx = db.transaction(SIMILARITY_FEATURE_STORE_NAME, 'readonly');
+            const store = tx.objectStore(SIMILARITY_FEATURE_STORE_NAME);
+            const request = store.count();
+            request.onsuccess = () => resolve(request.result || 0);
+            request.onerror = () => resolve(0);
+        });
+    }
+
+    async function clearSimilarityFeatureCache() {
+        similarityFeatureCache.clear();
+        if (!db || !db.objectStoreNames.contains(SIMILARITY_FEATURE_STORE_NAME)) return;
+        await new Promise(resolve => {
+            const tx = db.transaction(SIMILARITY_FEATURE_STORE_NAME, 'readwrite');
+            tx.objectStore(SIMILARITY_FEATURE_STORE_NAME).clear();
+            tx.oncomplete = tx.onerror = tx.onabort = () => resolve();
+        });
+        const status = byId('cache-status');
+        if (status) status.textContent = 'Similarity cache cleared.';
+        showToast('Similarity cache cleared.');
+    }
+
+    async function updateCacheInfoStatus() {
+        const count = await countSimilarityFeatureRecords();
+        const status = byId('cache-status');
+        if (status) status.textContent = `${count.toLocaleString('en-US')} cached feature record${count === 1 ? '' : 's'} stored. Current feature version: ${SIMILARITY_FEATURE_VERSION}.`;
+    }
+
+    async function buildMissingSimilarityCache() {
+        if (similaritySearchInProgress) {
+            showToast('Stop the current similarity search first.');
+            return;
+        }
+        const token = ++similarityAbortToken;
+        similarityAbortController = new AbortController();
+        const signal = similarityAbortController.signal;
+        similarityStopRequested = false;
+        similaritySearchInProgress = true;
+        const total = allItems.filter(item => !excludedStyleIds.has(item.id)).length;
+        let processed = 0, failed = 0, cached = 0, extracted = 0, nextIndex = 0;
+        const items = allItems.filter(item => !excludedStyleIds.has(item.id));
+        const workerCount = Math.min(getSimilarityConcurrency(), Math.max(1, items.length));
+        const startedAt = performance.now();
+        if (stopSimilarStyleBtn) {
+            stopSimilarStyleBtn.disabled = false;
+            stopSimilarStyleBtn.textContent = 'Stop';
+            stopSimilarStyleBtn.style.display = 'inline-flex';
+        }
+        if (similarStyleUploadBtn) similarStyleUploadBtn.disabled = true;
+        const status = byId('cache-status');
+        async function cacheWorker() {
+            while (token === similarityAbortToken && !similarityStopRequested) {
+                const index = nextIndex++;
+                if (index >= items.length) break;
+                try {
+                    const result = await getStyleFeature(items[index], token, signal);
+                    if (result.source === 'memory' || result.source === 'indexeddb') cached++;
+                    else extracted++;
+                } catch (error) {
+                    if (error?.name !== 'AbortError') failed++;
+                } finally {
+                    processed++;
+                    if (processed % 40 === 0 || processed === total) {
+                        setSimilarityProgress(processed, total);
+                        setSimilarStyleStatus(`Building cache... ${processed.toLocaleString('en-US')} / ${total.toLocaleString('en-US')} · ${formatSimilarityRate(processed, startedAt)} · ${cached.toLocaleString('en-US')} cached`, true);
+                        if (status) status.textContent = `${processed.toLocaleString('en-US')} / ${total.toLocaleString('en-US')} processed · ${extracted.toLocaleString('en-US')} newly extracted · ${failed.toLocaleString('en-US')} skipped.`;
+                        await new Promise(resolve => setTimeout(resolve, 0));
+                    }
+                }
+            }
+        }
+        try {
+            await Promise.all(Array.from({ length: workerCount }, () => cacheWorker()));
+            await flushSimilarityFeatureSaves();
+            setSimilarityProgress(processed, total);
+            setSimilarStyleStatus(`Cache build ${similarityStopRequested ? 'stopped' : 'complete'}: ${processed.toLocaleString('en-US')} processed.`, false);
+            await updateCacheInfoStatus();
+        } finally {
+            similaritySearchInProgress = false;
+            similarityAbortController = null;
+            similarityStopRequested = false;
+            if (stopSimilarStyleBtn) {
+                stopSimilarStyleBtn.disabled = false;
+                stopSimilarStyleBtn.textContent = 'Stop';
+                stopSimilarStyleBtn.style.display = 'none';
+            }
+            if (similarStyleUploadBtn) similarStyleUploadBtn.disabled = false;
+            updateControlsState();
+        }
+    }
+
+    function initAdvancedStyleTools() {
+        const templateInput = byId('prompt-template-input');
+        const savedTemplate = localStorage.getItem(ADVANCED_KEYS.template);
+        if (templateInput && savedTemplate) templateInput.value = savedTemplate;
+        byId('mix-strength-preset')?.addEventListener('change', updateMixOutput);
+        byId('random-strength-preset')?.addEventListener('change', () => {
+            if (randomStyleOutput?.value.trim()) getRandomStyles();
+        });
+        byId('copy-mix-btn')?.addEventListener('click', () => {
+            const text = byId('style-mix-output')?.value.trim();
+            copyTextWithHistory(text, 'Style mix copied!', 'style mix', { count: getSelectedMixItems().length });
+        });
+        byId('clear-mix-btn')?.addEventListener('click', () => {
+            mixSelectedIds.clear();
+            updateMixOutput();
+        });
+        byId('copy-top-results-btn')?.addEventListener('click', () => copyTopResults(false));
+        byId('copy-visible-results-btn')?.addEventListener('click', () => copyTopResults(true));
+        byId('apply-template-btn')?.addEventListener('click', applyTemplateToStyles);
+        byId('save-template-btn')?.addEventListener('click', () => {
+            localStorage.setItem(ADVANCED_KEYS.template, byId('prompt-template-input')?.value || '');
+            showToast('Prompt template saved.');
+        });
+        byId('add-exclude-btn')?.addEventListener('click', () => {
+            const input = byId('exclude-style-input');
+            const term = (input?.value || '').trim().toLowerCase();
+            if (!term) return;
+            const matches = allItems.filter(item => item.artist.toLowerCase().includes(term));
+            if (!matches.length) {
+                showToast('No matching styles found.');
+                return;
+            }
+            matches.forEach(item => excludedStyleIds.add(item.id));
+            if (input) input.value = '';
+            updateExcludeStatus();
+            if (similarityModeActive && !similaritySearchInProgress) applySimilarityThresholdAndRender(true);
+            else renderView();
+            showToast(`Excluded ${matches.length} style${matches.length === 1 ? '' : 's'}.`);
+        });
+        byId('clear-exclude-btn')?.addEventListener('click', () => {
+            excludedStyleIds.clear();
+            updateExcludeStatus();
+            renderView();
+        });
+        byId('add-tag-to-mix-btn')?.addEventListener('click', addTagsToMixSelection);
+        byId('favorite-tag-filter')?.addEventListener('change', () => renderView());
+        byId('open-compare-btn')?.addEventListener('click', showCompareModal);
+        byId('clear-compare-btn')?.addEventListener('click', () => {
+            compareSelectedIds.clear();
+            updateCompareStatus();
+        });
+        byId('open-history-btn')?.addEventListener('click', showHistoryModal);
+        byId('clear-history-btn')?.addEventListener('click', () => {
+            styleHistory = [];
+            localStorage.setItem(ADVANCED_KEYS.history, '[]');
+            showToast('History cleared.');
+        });
+        byId('compare-modal-close')?.addEventListener('click', closeCompareModal);
+        byId('history-modal-close')?.addEventListener('click', closeHistoryModal);
+        byId('compare-modal')?.addEventListener('click', (e) => { if (e.target.id === 'compare-modal') closeCompareModal(); });
+        byId('history-modal')?.addEventListener('click', (e) => { if (e.target.id === 'history-modal') closeHistoryModal(); });
+        byId('cache-info-btn')?.addEventListener('click', updateCacheInfoStatus);
+        byId('clear-cache-btn')?.addEventListener('click', clearSimilarityFeatureCache);
+        byId('build-cache-btn')?.addEventListener('click', buildMissingSimilarityCache);
+        byId('similar-style-cluster-filter')?.addEventListener('change', () => {
+            if (similarityModeActive && !similaritySearchInProgress) applySimilarityThresholdAndRender(true);
+        });
+        byId('similar-style-match-mode')?.addEventListener('change', () => {
+            if (similarityAllResults.length) setSimilarStyleStatus('Match mode changed. Run Similar Style Search again to rescore references.', false);
+        });
+        updateMixOutput();
+        updateCompareStatus();
+        updateExcludeStatus();
+        updateFavoriteTagOptions();
+        updateCacheInfoStatus();
+    }
     initDB()
         .then(() => {
             loadInitialData();
+            setTimeout(() => {
+                updateMixOutput();
+                updateCompareStatus();
+                updateExcludeStatus();
+                updateFavoriteTagOptions();
+                updateCacheInfoStatus();
+            }, 600);
         })
         .catch(err => {
             console.error(err);
             galleryContainer.innerHTML = '<p style="text-align: center; grid-column: 1 / -1;">Failed to initialize database.</p>';
         });
     setupTimedPromoModal(); // Вызываем новую функцию при инициализации
+    initAdvancedStyleTools();
 
 });
