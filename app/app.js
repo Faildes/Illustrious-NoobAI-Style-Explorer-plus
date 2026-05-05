@@ -28,6 +28,15 @@
     const searchWrapper = document.querySelector('.search-wrapper');
     const sortControls = document.querySelector('.sort-controls');
     const clearSearchBtn = document.getElementById('clear-search-btn');
+    const styleToolsWrapper = document.getElementById('style-tools-wrapper');
+    const randomStyleCountInput = document.getElementById('random-style-count');
+    const getRandomStyleBtn = document.getElementById('get-random-style-btn');
+    const copyRandomStyleBtn = document.getElementById('copy-random-style-btn');
+    const randomStyleOutput = document.getElementById('random-style-output');
+    const similarStyleInput = document.getElementById('similar-style-input');
+    const similarStyleUploadBtn = document.getElementById('similar-style-upload-btn');
+    const clearSimilarStyleBtn = document.getElementById('clear-similar-style-btn');
+    const similarStyleStatus = document.getElementById('similar-style-status');
     let allItems = [];
     const galleryTitle = document.getElementById('gallery-title');
     let itemsSortedByWorks = []; 
@@ -50,6 +59,14 @@
     const FOLDERS_PANEL_VISIBLE_KEY = 'foldersPanelVisible';
     let isJumpingToArtist = false; // Флаг для отслеживания состояния "прыжка"
     let isFoldersPanelVisible = true; // Состояние видимости панели папок
+    let similarityModeActive = false;
+    let similaritySearchInProgress = false;
+    let similarityItems = [];
+    let similarityAbortToken = 0;
+    const similarityFeatureCache = new Map();
+    const SIMILARITY_CANVAS_SIZE = 64;
+    const SIMILARITY_GRID_SIZE = 8;
+    const SIMILARITY_BATCH_SIZE = 12;
     const SORT_DIRECTION_KEY = 'sortDirection';
 
     // --- Глобальные переменные для доступа из других скриптов ---
@@ -146,6 +163,262 @@
             [array[i], array[j]] = [array[j], array[i]]; // Обмен элементами
         }
     }
+    function escapeHtml(value) {
+        return String(value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+    }
+
+    function setSimilarStyleStatus(message, isActive = false) {
+        if (!similarStyleStatus) return;
+        similarStyleStatus.textContent = message;
+        similarStyleStatus.classList.toggle('is-active', isActive);
+    }
+
+    function loadImageForSimilarity(src, useCrossOrigin = false) {
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            const timeoutId = setTimeout(() => {
+                img.onload = null;
+                img.onerror = null;
+                reject(new Error(`Timed out loading image: ${src}`));
+            }, 15000);
+            if (useCrossOrigin && /^https?:\/\//i.test(src)) {
+                img.crossOrigin = 'anonymous';
+            }
+            img.onload = () => {
+                clearTimeout(timeoutId);
+                resolve(img);
+            };
+            img.onerror = () => {
+                clearTimeout(timeoutId);
+                reject(new Error(`Could not load image: ${src}`));
+            };
+            img.src = src;
+        });
+    }
+
+    function extractImageFeature(img) {
+        const canvas = document.createElement('canvas');
+        canvas.width = SIMILARITY_CANVAS_SIZE;
+        canvas.height = SIMILARITY_CANVAS_SIZE;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0, SIMILARITY_CANVAS_SIZE, SIMILARITY_CANVAS_SIZE);
+
+        const { data } = ctx.getImageData(0, 0, SIMILARITY_CANVAS_SIZE, SIMILARITY_CANVAS_SIZE);
+        const channelBins = 8;
+        const redHist = new Array(channelBins).fill(0);
+        const greenHist = new Array(channelBins).fill(0);
+        const blueHist = new Array(channelBins).fill(0);
+        const lumaGrid = new Array(SIMILARITY_GRID_SIZE * SIMILARITY_GRID_SIZE).fill(0);
+        const gridCounts = new Array(SIMILARITY_GRID_SIZE * SIMILARITY_GRID_SIZE).fill(0);
+        const edgeGrid = new Array(SIMILARITY_GRID_SIZE * SIMILARITY_GRID_SIZE).fill(0);
+        const luma = new Float32Array(SIMILARITY_CANVAS_SIZE * SIMILARITY_CANVAS_SIZE);
+        const pixelCount = SIMILARITY_CANVAS_SIZE * SIMILARITY_CANVAS_SIZE;
+
+        for (let y = 0; y < SIMILARITY_CANVAS_SIZE; y++) {
+            for (let x = 0; x < SIMILARITY_CANVAS_SIZE; x++) {
+                const pixelIndex = y * SIMILARITY_CANVAS_SIZE + x;
+                const dataIndex = pixelIndex * 4;
+                const r = data[dataIndex];
+                const g = data[dataIndex + 1];
+                const b = data[dataIndex + 2];
+                const alpha = data[dataIndex + 3] / 255;
+                const safeR = r * alpha + 28 * (1 - alpha);
+                const safeG = g * alpha + 28 * (1 - alpha);
+                const safeB = b * alpha + 30 * (1 - alpha);
+                const lum = (0.299 * safeR + 0.587 * safeG + 0.114 * safeB) / 255;
+
+                redHist[Math.min(channelBins - 1, Math.floor(safeR / 32))]++;
+                greenHist[Math.min(channelBins - 1, Math.floor(safeG / 32))]++;
+                blueHist[Math.min(channelBins - 1, Math.floor(safeB / 32))]++;
+                luma[pixelIndex] = lum;
+
+                const gridX = Math.min(SIMILARITY_GRID_SIZE - 1, Math.floor(x / (SIMILARITY_CANVAS_SIZE / SIMILARITY_GRID_SIZE)));
+                const gridY = Math.min(SIMILARITY_GRID_SIZE - 1, Math.floor(y / (SIMILARITY_CANVAS_SIZE / SIMILARITY_GRID_SIZE)));
+                const gridIndex = gridY * SIMILARITY_GRID_SIZE + gridX;
+                lumaGrid[gridIndex] += lum;
+                gridCounts[gridIndex]++;
+            }
+        }
+
+        for (let y = 1; y < SIMILARITY_CANVAS_SIZE - 1; y++) {
+            for (let x = 1; x < SIMILARITY_CANVAS_SIZE - 1; x++) {
+                const center = y * SIMILARITY_CANVAS_SIZE + x;
+                const dx = Math.abs(luma[center + 1] - luma[center - 1]);
+                const dy = Math.abs(luma[center + SIMILARITY_CANVAS_SIZE] - luma[center - SIMILARITY_CANVAS_SIZE]);
+                const gridX = Math.min(SIMILARITY_GRID_SIZE - 1, Math.floor(x / (SIMILARITY_CANVAS_SIZE / SIMILARITY_GRID_SIZE)));
+                const gridY = Math.min(SIMILARITY_GRID_SIZE - 1, Math.floor(y / (SIMILARITY_CANVAS_SIZE / SIMILARITY_GRID_SIZE)));
+                edgeGrid[gridY * SIMILARITY_GRID_SIZE + gridX] += Math.sqrt(dx * dx + dy * dy);
+            }
+        }
+
+        const feature = [];
+        redHist.forEach(v => feature.push((v / pixelCount) * 1.2));
+        greenHist.forEach(v => feature.push((v / pixelCount) * 1.2));
+        blueHist.forEach(v => feature.push((v / pixelCount) * 1.2));
+        lumaGrid.forEach((v, i) => feature.push((v / Math.max(1, gridCounts[i])) * 0.8));
+        edgeGrid.forEach(v => feature.push((v / Math.max(1, pixelCount / (SIMILARITY_GRID_SIZE * SIMILARITY_GRID_SIZE))) * 0.55));
+
+        return Float32Array.from(feature);
+    }
+
+    function cosineSimilarity(featureA, featureB) {
+        let dot = 0;
+        let normA = 0;
+        let normB = 0;
+        const length = Math.min(featureA.length, featureB.length);
+        for (let i = 0; i < length; i++) {
+            dot += featureA[i] * featureB[i];
+            normA += featureA[i] * featureA[i];
+            normB += featureB[i] * featureB[i];
+        }
+        if (!normA || !normB) return 0;
+        return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+    }
+
+    async function getStyleFeature(item) {
+        if (similarityFeatureCache.has(item.id)) {
+            return similarityFeatureCache.get(item.id);
+        }
+
+        const img = await loadImageForSimilarity(item.image, true);
+        const feature = extractImageFeature(img);
+        similarityFeatureCache.set(item.id, feature);
+        return feature;
+    }
+
+    function clearSimilaritySearch(shouldRender = true) {
+        similarityAbortToken++;
+        similarityModeActive = false;
+        similaritySearchInProgress = false;
+        similarityItems = [];
+        galleryContainer.classList.remove('similarity-view');
+
+        if (similarStyleInput) similarStyleInput.value = '';
+        if (clearSimilarStyleBtn) clearSimilarStyleBtn.style.display = 'none';
+        if (similarStyleUploadBtn) similarStyleUploadBtn.disabled = false;
+        setSimilarStyleStatus('Upload an image to rank styles by visual similarity.', false);
+
+        if (currentView === 'gallery') {
+            styleCounter.innerHTML = `Artist-based styles: <span class="style-count-number">${allItems.length.toLocaleString('en-US')}</span>`;
+        }
+        updateControlsState();
+        if (shouldRender && currentView === 'gallery') {
+            renderView();
+        }
+    }
+
+    async function runSimilarStyleSearch(file) {
+        if (!file) return;
+        if (!file.type.startsWith('image/')) {
+            showToast('Please choose an image file.');
+            return;
+        }
+
+        const token = ++similarityAbortToken;
+        similarityModeActive = false;
+        similaritySearchInProgress = true;
+        similarityItems = [];
+        startIndexOffset = 0;
+        searchInput.value = '';
+        searchTerm = '';
+        jumpInput.value = '';
+        clearSearchBtn.style.display = 'none';
+        clearJumpBtn.style.display = 'none';
+        if (clearSimilarStyleBtn) clearSimilarStyleBtn.style.display = 'inline-flex';
+        if (similarStyleUploadBtn) similarStyleUploadBtn.disabled = true;
+        setSimilarStyleStatus('Analyzing uploaded image...', true);
+        updateControlsState();
+
+        let objectUrl = null;
+        try {
+            objectUrl = URL.createObjectURL(file);
+            const queryImage = await loadImageForSimilarity(objectUrl, false);
+            const queryFeature = extractImageFeature(queryImage);
+            const results = [];
+            let failedCount = 0;
+
+            for (let i = 0; i < allItems.length; i += SIMILARITY_BATCH_SIZE) {
+                if (token !== similarityAbortToken) return;
+                const batch = allItems.slice(i, i + SIMILARITY_BATCH_SIZE);
+                const settled = await Promise.allSettled(batch.map(async item => {
+                    const feature = await getStyleFeature(item);
+                    return { item, score: cosineSimilarity(queryFeature, feature) };
+                }));
+
+                settled.forEach(result => {
+                    if (result.status === 'fulfilled') {
+                        results.push(result.value);
+                    } else {
+                        failedCount++;
+                    }
+                });
+
+                const processed = Math.min(i + SIMILARITY_BATCH_SIZE, allItems.length);
+                setSimilarStyleStatus(`Analyzing styles... ${processed.toLocaleString('en-US')} / ${allItems.length.toLocaleString('en-US')}`, true);
+                await new Promise(resolve => setTimeout(resolve, 0));
+            }
+
+            if (token !== similarityAbortToken) return;
+            if (results.length === 0) {
+                throw new Error('No preview images could be analyzed. If you are running locally, try serving the folder with a local web server instead of opening index.html directly.');
+            }
+
+            results.sort((a, b) => b.score - a.score);
+            similarityItems = results.map((result, index) => ({
+                ...result.item,
+                similarityScore: result.score,
+                similarityRank: index + 1
+            }));
+            similarityModeActive = true;
+            similaritySearchInProgress = false;
+            if (similarStyleUploadBtn) similarStyleUploadBtn.disabled = false;
+
+            const failedText = failedCount > 0 ? ` (${failedCount.toLocaleString('en-US')} previews skipped)` : '';
+            setSimilarStyleStatus(`Similar style results ready: ${similarityItems.length.toLocaleString('en-US')} styles${failedText}.`, false);
+            styleCounter.innerHTML = `Similar Style Search: <span class="style-count-number">${similarityItems.length.toLocaleString('en-US')}</span>`;
+            renderView();
+        } catch (error) {
+            console.error('Similar Style Search failed:', error);
+            similarityModeActive = false;
+            similaritySearchInProgress = false;
+            similarityItems = [];
+            if (similarStyleUploadBtn) similarStyleUploadBtn.disabled = false;
+            setSimilarStyleStatus(error.message || 'Similar Style Search failed.', false);
+            showToast('Similar Style Search failed.');
+            updateControlsState();
+        } finally {
+            if (objectUrl) URL.revokeObjectURL(objectUrl);
+        }
+    }
+
+    function getRandomStyles() {
+        const count = Math.max(1, Math.min(200, parseInt(randomStyleCountInput?.value, 10) || 1));
+        if (randomStyleCountInput) randomStyleCountInput.value = count;
+
+        const sourceItems = similarityModeActive && currentView === 'gallery' && similarityItems.length
+            ? similarityItems
+            : allItems;
+        if (!sourceItems.length) {
+            showToast('No styles available.');
+            return;
+        }
+
+        const pool = [...sourceItems];
+        shuffleArray(pool);
+        const pickedStyles = pool.slice(0, Math.min(count, pool.length)).map(item => item.artist);
+        if (randomStyleOutput) {
+            randomStyleOutput.value = pickedStyles.join(', ');
+            randomStyleOutput.focus();
+            randomStyleOutput.select();
+        }
+        showToast(`${pickedStyles.length} random style${pickedStyles.length === 1 ? '' : 's'} generated.`);
+    }
+
     /**
      * Debug: Проверяет доступность всех изображений и выводит статистику в консоль.
      * Работает только если DEBUG_MODE = true.
@@ -202,6 +475,9 @@
         const rankHTML = sortType === 'uniqueness' && item.uniquenessRank
             ? `<div class="uniqueness-rank" title="Uniqueness Rank">#${item.uniquenessRank}</div>`
             : '';
+        const similarityHTML = typeof item.similarityScore === 'number'
+            ? `<div class="similarity-score" title="Visual similarity rank and score">#${item.similarityRank} · ${Math.round(item.similarityScore * 100)}%</div>`
+            : '';
 
         let favButtonHTML;
         if (currentView === 'favorites') {
@@ -237,6 +513,7 @@
                 ${item.worksCount.toLocaleString('en-US')}
             </div>
             ${rankHTML}
+            ${similarityHTML}
             ${favButtonHTML}
         `;
 
@@ -355,6 +632,7 @@
         }
         // Добавляем класс для вида "Избранное"
         galleryContainer.classList.toggle('favorites-view', currentView === 'favorites');
+        galleryContainer.classList.toggle('similarity-view', currentView === 'gallery' && similarityModeActive);
 
         // --- Логика "Продолжить просмотр" ---
         const jumpToArtistId = localStorage.getItem('jumpToArtistId');
@@ -393,6 +671,20 @@
 
         window.scrollTo({ top: 0, behavior: 'instant' }); // Мгновенная прокрутка вверх при ререндере
         
+        if (similarityModeActive && currentView === 'gallery') {
+            currentItems = similarityItems.slice(startIndexOffset);
+            if (currentItems.length === 0) {
+                const p = document.createElement('p');
+                p.style.textAlign = 'center';
+                p.style.gridColumn = '1 / -1';
+                p.innerText = 'No similar style results are available.';
+                galleryContainer.appendChild(p);
+                return;
+            }
+            loadMoreItems();
+            return;
+        }
+
         // 1. Сортируем данные
         let sortedItems = [...allItems];
         const direction = sortDirection === 'asc' ? 1 : -1;
@@ -662,15 +954,18 @@
     function updateControlsState() {
         const isSearchingByName = searchInput.value.trim().length > 0;
         const isJumpingByCount = jumpInput.value.trim().length > 0;
+        const isSimilarityLocked = currentView === 'gallery' && (similarityModeActive || similaritySearchInProgress);
 
         // Блокируем сортировку, если активен любой из поисков
-        sortControls.classList.toggle('disabled', isSearchingByName || isJumpingByCount);
+        sortControls.classList.toggle('disabled', isSearchingByName || isJumpingByCount || isSimilarityLocked);
         // Блокируем "Jump", если идет поиск по имени
-        jumpControls.classList.toggle('disabled', isSearchingByName);
+        jumpControls.classList.toggle('disabled', isSearchingByName || isSimilarityLocked);
         // Блокируем поиск по имени, если идет поиск по "Jump"
-        searchInput.parentElement.classList.toggle('disabled', isJumpingByCount);
+        searchInput.parentElement.classList.toggle('disabled', isJumpingByCount || isSimilarityLocked);
         // Блокируем Swipe Mode, если идет поиск по имени или "Jump"
-        swipeLaunchControls.classList.toggle('disabled', isSearchingByName || isJumpingByCount);
+        swipeLaunchControls.classList.toggle('disabled', isSearchingByName || isJumpingByCount || isSimilarityLocked);
+        if (getRandomStyleBtn) getRandomStyleBtn.disabled = similaritySearchInProgress;
+        if (copyRandomStyleBtn) copyRandomStyleBtn.disabled = similaritySearchInProgress;
     }
 
     function updateJumpToArtistHint() {
@@ -717,6 +1012,7 @@
         searchInput.parentElement.style.borderBottom = '1px solid var(--border-color)'; // Восстанавливаем разделитель
         swipeLaunchControls.style.display = 'flex';
         sortControls.style.display = 'flex';
+        if (styleToolsWrapper) styleToolsWrapper.style.display = 'grid';
         currentView = 'gallery';
         // Сбрасываем флаг принудительно, если пользователь сам переключился на галерею
         isJumpingToArtist = false;
@@ -746,6 +1042,8 @@
         searchInput.parentElement.style.borderBottom = 'none'; // Убираем разделитель, т.к. поле Jump скрыто
         swipeLaunchControls.style.display = 'none';
         sortControls.style.display = 'none'; // Скрываем сортировку для избранного
+        if (styleToolsWrapper) styleToolsWrapper.style.display = 'none';
+        clearSimilaritySearch(false);
         currentView = 'favorites';
 
         // Обновляем счетчик для отображения количества избранных
@@ -995,6 +1293,53 @@
         URL.revokeObjectURL(url);
     });
 
+    // --- Random style and visual similarity tools ---
+    if (getRandomStyleBtn) {
+        getRandomStyleBtn.addEventListener('click', getRandomStyles);
+    }
+
+    if (randomStyleCountInput) {
+        randomStyleCountInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                getRandomStyles();
+            }
+        });
+    }
+
+    if (copyRandomStyleBtn) {
+        copyRandomStyleBtn.addEventListener('click', () => {
+            const text = randomStyleOutput?.value.trim();
+            if (!text) {
+                showToast('No random styles to copy.');
+                return;
+            }
+            navigator.clipboard.writeText(text).then(() => {
+                showToast('Random styles copied to clipboard!');
+            }).catch(() => {
+                showToast('Could not copy random styles.');
+            });
+        });
+    }
+
+    if (similarStyleUploadBtn && similarStyleInput) {
+        similarStyleUploadBtn.addEventListener('click', () => {
+            if (similaritySearchInProgress) return;
+            similarStyleInput.click();
+        });
+
+        similarStyleInput.addEventListener('change', (event) => {
+            const file = event.target.files?.[0];
+            if (file) {
+                runSimilarStyleSearch(file);
+            }
+        });
+    }
+
+    if (clearSimilarStyleBtn) {
+        clearSimilarStyleBtn.addEventListener('click', () => clearSimilaritySearch(true));
+    }
+
     // Обработка ввода в строке поиска
     searchInput.addEventListener('input', (e) => {
         const newSearchTerm = e.target.value.toLowerCase().trim();
@@ -1188,6 +1533,9 @@
     }
 
     function handleSortClick(clickedType) {
+        if (similarityModeActive || similaritySearchInProgress) {
+            clearSimilaritySearch(false);
+        }
         // Если был активен "прыжок к художнику", сбрасываем его
         if (isJumpingToArtist) {
             startIndexOffset = 0;
