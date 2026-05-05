@@ -14,7 +14,7 @@
     <title>Illustrious XL &amp; NoobAI-XL Style Explorer | 16,000+ Danbooru Artist Styles</title>
     <meta name="description" content="Visual database of 16,000+ Danbooru artist styles for the popular Illustrious XL and NoobAI-XL models. Browse high-quality previews, compare artist influence, check dataset strength, and copy optimized prompts for Stable Diffusion, ComfyUI, and Forge. Perfect for both models.">
     <meta name="keywords" content="Illustrious XL, NoobAI-XL, NAI-XL, Illustrious XL artist styles, NoobAI-XL prompts, Danbooru artist styles, Danbooru tags, Stable Diffusion XL, anime AI art, AI artist library, Laxhar Lab, OnomaAI, SDXL prompts">
-    <link rel="stylesheet" href="app/style.css?v=2">
+    <link rel="stylesheet" href="app/style.css?v=3">
     
     <meta property="og:title" content="Illustrious XL &amp; NoobAI-XL Style Explorer — 16,000+ Danbooru Artist Styles">
     <meta property="og:description" content="Explore 16,000+ Danbooru artist styles that work perfectly in both the massively popular Illustrious XL and its powerful fine-tune NoobAI-XL. Instant visual previews and one-click prompts.">
@@ -96,6 +96,28 @@
                     <button id="clear-jump-btn" class="clear-input-btn" title="Clear jump" style="display: none;">×</button> 
                 </div>
             </div>
+            <div id="style-tools-wrapper" class="style-tools-wrapper">
+                <section class="style-tool-card random-style-tool" aria-labelledby="random-style-title">
+                    <div class="style-tool-header" id="random-style-title">Get Random Style</div>
+                    <div class="style-tool-row">
+                        <label class="visually-hidden" for="random-style-count">Number of random styles</label>
+                        <input type="number" id="random-style-count" class="style-tool-input" min="1" max="200" value="4" title="Number of styles to output">
+                        <button id="get-random-style-btn" class="sort-button style-tool-button" title="Get random styles">Get Random Style</button>
+                        <button id="copy-random-style-btn" class="sort-button style-tool-button compact" title="Copy random styles">Copy</button>
+                    </div>
+                    <textarea id="random-style-output" class="style-tool-textarea" rows="3" readonly placeholder="Random styles will appear here as comma-separated tags."></textarea>
+                </section>
+
+                <section class="style-tool-card similar-style-tool" aria-labelledby="similar-style-title">
+                    <div class="style-tool-header" id="similar-style-title">Similar Style Search</div>
+                    <div class="style-tool-row">
+                        <input type="file" id="similar-style-input" accept="image/*" style="display: none;">
+                        <button id="similar-style-upload-btn" class="sort-button style-tool-button" title="Search styles visually similar to an uploaded image">Choose Image</button>
+                        <button id="clear-similar-style-btn" class="sort-button style-tool-button compact" title="Clear similar style search" style="display: none;">Clear</button>
+                    </div>
+                    <div id="similar-style-status" class="similar-style-status">Upload an image to rank styles by visual similarity.</div>
+                </section>
+            </div>
             <div id="swipe-continue-hint" class="hotkey-hint" style="display: none;" title="Jump to this artist in the main gallery">
                 Middle-click a card to find in gallery
             </div>
@@ -174,9 +196,9 @@
         <div class="swipe-hint">Use <kbd>←</kbd> <kbd>→</kbd> to navigate, <kbd>C</kbd> to copy name, <kbd>↓</kbd> to favorite, <kbd>Esc</kbd> to close</div>
     </div>
 
-    <script src="app/data.js?v=2"></script>
-    <script src="app/app.js?v=2"></script>
-    <script src="app/swipe-mode.js?v=2"></script>
-    <script src="app/folders.js?v=2"></script>
+    <script src="app/data.js?v=3"></script>
+    <script src="app/app.js?v=3"></script>
+    <script src="app/swipe-mode.js?v=3"></script>
+    <script src="app/folders.js?v=3"></script>
 </body>
 </html>
