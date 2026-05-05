@@ -30,6 +30,7 @@
     const clearSearchBtn = document.getElementById('clear-search-btn');
     const styleToolsWrapper = document.getElementById('style-tools-wrapper');
     const randomStyleCountInput = document.getElementById('random-style-count');
+    const randomAutoStrengthCheckbox = document.getElementById('random-auto-strength-checkbox');
     const getRandomStyleBtn = document.getElementById('get-random-style-btn');
     const copyRandomStyleBtn = document.getElementById('copy-random-style-btn');
     const randomStyleOutput = document.getElementById('random-style-output');
@@ -2503,10 +2504,18 @@
     }
 
     function getAutoStyleWeight(item) {
-        const maxWorks = Math.max(1, ...allItems.map(entry => Number(entry.worksCount) || 0));
-        const count = Math.max(0, Number(item?.worksCount) || 0);
-        const popularity = Math.log(count + 1) / Math.log(maxWorks + 1);
-        const weight = 1.5 - (popularity * 1.4);
+        const counts = allItems
+            .map(entry => Number(entry.worksCount) || 0)
+            .filter(count => count > 0);
+        const minWorks = Math.max(1, Math.min(...counts));
+        const maxWorks = Math.max(minWorks + 1, Math.max(...counts));
+        const count = Math.max(1, Number(item?.worksCount) || minWorks);
+        const clampedCount = Math.max(minWorks, Math.min(maxWorks, count));
+        const minLog = Math.log(minWorks + 1);
+        const maxLog = Math.log(maxWorks + 1);
+        const normalizedPopularity = (Math.log(clampedCount + 1) - minLog) / Math.max(0.0001, maxLog - minLog);
+        const rarity = 1 - normalizedPopularity; // fewer entries => larger rarity => stronger weight
+        const weight = 0.1 + (rarity * 1.4);
         return Math.max(0.1, Math.min(1.5, Number(weight.toFixed(2))));
     }
 
@@ -3199,7 +3208,7 @@
     function getRandomStyles() {
         const count = Math.max(1, Math.min(200, parseInt(randomStyleCountInput?.value, 10) || 1));
         if (randomStyleCountInput) randomStyleCountInput.value = count;
-        const preset = getStrengthPreset('random-strength-preset');
+        const preset = randomAutoStrengthCheckbox?.checked ? 'auto' : getStrengthPreset('random-strength-preset');
         const sourceItems = (similarityModeActive && currentView === 'gallery' && similarityItems.length ? similarityItems : allItems)
             .filter(item => !excludedStyleIds.has(item.id));
         if (!sourceItems.length) {
@@ -3434,7 +3443,85 @@
         }
     }
 
+
+
+    function initToolCardToggles() {
+        const root = document.getElementById('style-tools-wrapper');
+        if (!root) return;
+
+        const STORAGE_KEY = 'styleToolCardCollapsedStateV1';
+        let collapsedState = {};
+        try {
+            collapsedState = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}') || {};
+        } catch (error) {
+            collapsedState = {};
+        }
+
+        const getCardKey = (card, index) => {
+            if (card.id) return card.id;
+            const labelId = card.getAttribute('aria-labelledby');
+            if (labelId) return labelId;
+            const heading = card.querySelector(':scope > h3, :scope > .style-tool-header, :scope > summary');
+            const headingText = heading ? heading.textContent.trim().toLowerCase().replace(/\s+/g, '-') : '';
+            const classKey = Array.from(card.classList).filter(cls => cls !== 'style-tool-card' && cls !== 'advanced-tool-section').join('-');
+            return classKey || headingText || `tool-card-${index}`;
+        };
+
+        const getHeaderElement = (card) => {
+            if (card.tagName === 'DETAILS') return card.querySelector(':scope > summary');
+            return card.querySelector(':scope > .style-tool-header, :scope > h3');
+        };
+
+        const setCollapsed = (card, button, key, collapsed) => {
+            collapsedState[key] = collapsed;
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(collapsedState));
+            card.classList.toggle('tool-card-collapsed', collapsed);
+            button.classList.toggle('is-collapsed', collapsed);
+            button.setAttribute('aria-expanded', String(!collapsed));
+            button.title = collapsed ? 'Show this tool card' : 'Hide this tool card';
+            button.setAttribute('aria-label', collapsed ? 'Show this tool card' : 'Hide this tool card');
+            if (card.tagName === 'DETAILS') card.open = true;
+        };
+
+        const cards = root.querySelectorAll(':scope > .style-tool-card, .advanced-tool-section');
+        cards.forEach((card, index) => {
+            if (card.dataset.toolToggleReady === 'true') return;
+            const header = getHeaderElement(card);
+            if (!header) return;
+
+            if (card.tagName === 'DETAILS') {
+                card.open = true;
+                header.addEventListener('click', (event) => {
+                    if (!event.target.closest('.tool-card-toggle')) event.preventDefault();
+                });
+            }
+
+            const key = getCardKey(card, index);
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'tool-card-toggle';
+            button.innerHTML = '<span></span><span></span><span></span>';
+            header.insertBefore(button, header.firstChild);
+
+            const initialCollapsed = Boolean(collapsedState[key]);
+            card.classList.toggle('tool-card-collapsed', initialCollapsed);
+            button.classList.toggle('is-collapsed', initialCollapsed);
+            button.setAttribute('aria-expanded', String(!initialCollapsed));
+            button.title = initialCollapsed ? 'Show this tool card' : 'Hide this tool card';
+            button.setAttribute('aria-label', initialCollapsed ? 'Show this tool card' : 'Hide this tool card');
+
+            button.addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setCollapsed(card, button, key, !card.classList.contains('tool-card-collapsed'));
+            });
+
+            card.dataset.toolToggleReady = 'true';
+        });
+    }
+
     function initAdvancedStyleTools() {
+        initToolCardToggles();
         const templateInput = byId('prompt-template-input');
         const savedTemplate = localStorage.getItem(ADVANCED_KEYS.template);
         if (templateInput && savedTemplate) templateInput.value = savedTemplate;
@@ -3442,6 +3529,15 @@
         byId('random-strength-preset')?.addEventListener('change', () => {
             if (randomStyleOutput?.value.trim()) getRandomStyles();
         });
+        randomAutoStrengthCheckbox?.addEventListener('change', () => {
+            const presetSelect = byId('random-strength-preset');
+            if (presetSelect) presetSelect.disabled = randomAutoStrengthCheckbox.checked;
+            if (randomStyleOutput?.value.trim()) getRandomStyles();
+        });
+        if (randomAutoStrengthCheckbox?.checked) {
+            const presetSelect = byId('random-strength-preset');
+            if (presetSelect) presetSelect.disabled = true;
+        }
         byId('copy-mix-btn')?.addEventListener('click', () => {
             const text = byId('style-mix-output')?.value.trim();
             copyTextWithHistory(text, 'Style mix copied!', 'style mix', { count: getSelectedMixItems().length });
