@@ -2591,3 +2591,63 @@ input[type="range"]::-webkit-slider-thumb {
         font-size: 11px;
     }
 }
+
+
+/* --- Fast Similar Style Search controls --- */
+.similar-style-options {
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.similar-style-option {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--secondary-text-color);
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.style-tool-input.small {
+    width: 70px;
+    min-width: 70px;
+    padding: 7px 8px;
+    text-align: center;
+}
+
+.style-tool-button.danger {
+    border-color: rgba(255, 69, 58, 0.65);
+    color: #ff6961;
+}
+
+.style-tool-button.danger:hover {
+    border-color: #ff453a;
+    background-color: rgba(255, 69, 58, 0.12);
+    color: #ff8a80;
+}
+
+.style-tool-button:disabled,
+.swipe-launch-button:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+.similar-style-progress {
+    width: 100%;
+    height: 6px;
+    background-color: rgba(255, 255, 255, 0.08);
+    border: 1px solid var(--border-color);
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+.similar-style-progress-fill {
+    width: 0%;
+    height: 100%;
+    background-color: var(--accent-color);
+    transition: width 0.18s ease-out;
+}
+

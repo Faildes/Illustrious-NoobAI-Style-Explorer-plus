@@ -37,6 +37,10 @@
     const similarStyleUploadBtn = document.getElementById('similar-style-upload-btn');
     const clearSimilarStyleBtn = document.getElementById('clear-similar-style-btn');
     const similarStyleStatus = document.getElementById('similar-style-status');
+    const similarStyleThresholdInput = document.getElementById('similar-style-threshold');
+    const similarStyleConcurrencyInput = document.getElementById('similar-style-concurrency');
+    const stopSimilarStyleBtn = document.getElementById('stop-similar-style-btn');
+    const similarStyleProgressFill = document.getElementById('similar-style-progress-fill');
     let allItems = [];
     const galleryTitle = document.getElementById('gallery-title');
     let itemsSortedByWorks = []; 
@@ -62,11 +66,21 @@
     let similarityModeActive = false;
     let similaritySearchInProgress = false;
     let similarityItems = [];
+    let similarityAllResults = [];
+    let similarityLastStats = null;
     let similarityAbortToken = 0;
+    let similarityStopRequested = false;
+    let similarityAbortController = null;
     const similarityFeatureCache = new Map();
-    const SIMILARITY_CANVAS_SIZE = 64;
-    const SIMILARITY_GRID_SIZE = 8;
-    const SIMILARITY_BATCH_SIZE = 12;
+    let pendingSimilarityFeatureSaves = [];
+    let pendingSimilarityFeatureSaveTimer = null;
+    const SIMILARITY_CANVAS_SIZE = 48;
+    const SIMILARITY_GRID_SIZE = 6;
+    const SIMILARITY_FEATURE_STORE_NAME = 'similarity_features';
+    const SIMILARITY_FEATURE_VERSION = `v4-${SIMILARITY_CANVAS_SIZE}-${SIMILARITY_GRID_SIZE}`;
+    const SIMILARITY_MIN_CONCURRENCY = 4;
+    const SIMILARITY_MAX_CONCURRENCY = 128;
+    const SIMILARITY_DEFAULT_CONCURRENCY = Math.min(96, Math.max(16, (navigator.hardwareConcurrency || 8) * 6));
     const SORT_DIRECTION_KEY = 'sortDirection';
 
     // --- Глобальные переменные для доступа из других скриптов ---
@@ -94,6 +108,13 @@
         ? 'https://cdn.jsdelivr.net/gh/ThetaCursed/Illustrious-NoobAI-Style-Explorer@main/'  
         : '';
 
+    if (similarStyleConcurrencyInput) {
+        const initialConcurrency = parseInt(similarStyleConcurrencyInput.value, 10);
+        if (!Number.isFinite(initialConcurrency) || initialConcurrency <= 0) {
+            similarStyleConcurrencyInput.value = SIMILARITY_DEFAULT_CONCURRENCY;
+        }
+    }
+
 
 
 
@@ -106,7 +127,7 @@
 
     function initDB() {
         return new Promise((resolve, reject) => {
-            const request = indexedDB.open(DB_NAME, 4); // Увеличиваем версию для обновления схемы
+            const request = indexedDB.open(DB_NAME, 5); // Увеличиваем версию для обновления схемы
 
             request.onerror = () => {
                 console.error('IndexedDB error:', request.error);
@@ -135,6 +156,11 @@
                 // Хранилище для связи артистов и папок
                 if (!upgradeDb.objectStoreNames.contains('folder_artists')) {
                     upgradeDb.createObjectStore('folder_artists', { keyPath: 'folderId' });
+                }
+                // Persistent cache for Similar Style Search image features.
+                // This avoids re-reading all 16k preview images on repeated searches.
+                if (!upgradeDb.objectStoreNames.contains(SIMILARITY_FEATURE_STORE_NAME)) {
+                    upgradeDb.createObjectStore(SIMILARITY_FEATURE_STORE_NAME, { keyPath: 'id' });
                 }
             };
         });
@@ -178,27 +204,125 @@
         similarStyleStatus.classList.toggle('is-active', isActive);
     }
 
-    function loadImageForSimilarity(src, useCrossOrigin = false) {
+    function setSimilarityProgress(processed = 0, total = 0) {
+        if (!similarStyleProgressFill) return;
+        const percent = total > 0 ? Math.max(0, Math.min(100, (processed / total) * 100)) : 0;
+        similarStyleProgressFill.style.width = `${percent}%`;
+    }
+
+    function clampNumber(value, min, max, fallback) {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed)) return fallback;
+        return Math.max(min, Math.min(max, parsed));
+    }
+
+    function getSimilarityThreshold() {
+        const threshold = clampNumber(similarStyleThresholdInput?.value, 0, 100, 0);
+        if (similarStyleThresholdInput && String(similarStyleThresholdInput.value) !== String(threshold)) {
+            similarStyleThresholdInput.value = threshold;
+        }
+        return threshold;
+    }
+
+    function getSimilarityConcurrency() {
+        const concurrency = Math.round(clampNumber(
+            similarStyleConcurrencyInput?.value,
+            SIMILARITY_MIN_CONCURRENCY,
+            SIMILARITY_MAX_CONCURRENCY,
+            SIMILARITY_DEFAULT_CONCURRENCY
+        ));
+        if (similarStyleConcurrencyInput) similarStyleConcurrencyInput.value = concurrency;
+        return concurrency;
+    }
+
+    function formatSimilarityPercent(score) {
+        const percent = Math.max(0, Math.min(100, score * 100));
+        return `${percent.toFixed(percent >= 99.95 ? 0 : 1).replace(/\.0$/, '')}%`;
+    }
+
+    function formatSimilarityRate(processed, startedAt) {
+        const elapsedSeconds = Math.max(0.001, (performance.now() - startedAt) / 1000);
+        return `${(processed / elapsedSeconds).toFixed(1)} styles/s`;
+    }
+
+    function makeAbortError() {
+        return new DOMException('Similar Style Search was stopped.', 'AbortError');
+    }
+
+    function throwIfSimilarityStopped(token, signal) {
+        if (token !== similarityAbortToken || similarityStopRequested || signal?.aborted) {
+            throw makeAbortError();
+        }
+    }
+
+    function loadImageForSimilarity(src, useCrossOrigin = false, signal = null) {
+        if (signal?.aborted) return Promise.reject(makeAbortError());
+
+        if (/^https?:\/\//i.test(src) && typeof fetch === 'function' && typeof createImageBitmap === 'function') {
+            const fetchController = new AbortController();
+            const timeoutId = setTimeout(() => fetchController.abort(), 20000);
+            const onAbort = () => fetchController.abort();
+            if (signal) signal.addEventListener('abort', onAbort, { once: true });
+
+            return fetch(src, { mode: 'cors', cache: 'force-cache', signal: fetchController.signal })
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`Could not load image: ${src} (${response.status})`);
+                    }
+                    return response.blob();
+                })
+                .then(blob => createImageBitmap(blob, {
+                    resizeWidth: SIMILARITY_CANVAS_SIZE,
+                    resizeHeight: SIMILARITY_CANVAS_SIZE,
+                    resizeQuality: 'low'
+                }).catch(() => createImageBitmap(blob)))
+                .catch(error => {
+                    if (signal?.aborted || error?.name === 'AbortError') throw makeAbortError();
+                    throw error;
+                })
+                .finally(() => {
+                    clearTimeout(timeoutId);
+                    if (signal) signal.removeEventListener('abort', onAbort);
+                });
+        }
+
         return new Promise((resolve, reject) => {
             const img = new Image();
-            const timeoutId = setTimeout(() => {
+            let settled = false;
+            const cleanup = () => {
+                clearTimeout(timeoutId);
                 img.onload = null;
                 img.onerror = null;
-                reject(new Error(`Timed out loading image: ${src}`));
-            }, 15000);
+                if (signal) signal.removeEventListener('abort', onAbort);
+            };
+            const finish = (callback, value) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                callback(value);
+            };
+            const onAbort = () => {
+                img.src = '';
+                finish(reject, makeAbortError());
+            };
+            const timeoutId = setTimeout(() => {
+                finish(reject, new Error(`Timed out loading image: ${src}`));
+            }, 20000);
+
+            if (signal) signal.addEventListener('abort', onAbort, { once: true });
             if (useCrossOrigin && /^https?:\/\//i.test(src)) {
                 img.crossOrigin = 'anonymous';
             }
-            img.onload = () => {
-                clearTimeout(timeoutId);
-                resolve(img);
-            };
-            img.onerror = () => {
-                clearTimeout(timeoutId);
-                reject(new Error(`Could not load image: ${src}`));
-            };
+            img.onload = () => finish(resolve, img);
+            img.onerror = () => finish(reject, new Error(`Could not load image: ${src}`));
             img.src = src;
         });
+    }
+
+    function closeDrawableForSimilarity(drawable) {
+        if (drawable && typeof drawable.close === 'function') {
+            drawable.close();
+        }
     }
 
     function extractImageFeature(img) {
@@ -218,6 +342,7 @@
         const edgeGrid = new Array(SIMILARITY_GRID_SIZE * SIMILARITY_GRID_SIZE).fill(0);
         const luma = new Float32Array(SIMILARITY_CANVAS_SIZE * SIMILARITY_CANVAS_SIZE);
         const pixelCount = SIMILARITY_CANVAS_SIZE * SIMILARITY_CANVAS_SIZE;
+        const gridCellSize = SIMILARITY_CANVAS_SIZE / SIMILARITY_GRID_SIZE;
 
         for (let y = 0; y < SIMILARITY_CANVAS_SIZE; y++) {
             for (let x = 0; x < SIMILARITY_CANVAS_SIZE; x++) {
@@ -237,8 +362,8 @@
                 blueHist[Math.min(channelBins - 1, Math.floor(safeB / 32))]++;
                 luma[pixelIndex] = lum;
 
-                const gridX = Math.min(SIMILARITY_GRID_SIZE - 1, Math.floor(x / (SIMILARITY_CANVAS_SIZE / SIMILARITY_GRID_SIZE)));
-                const gridY = Math.min(SIMILARITY_GRID_SIZE - 1, Math.floor(y / (SIMILARITY_CANVAS_SIZE / SIMILARITY_GRID_SIZE)));
+                const gridX = Math.min(SIMILARITY_GRID_SIZE - 1, Math.floor(x / gridCellSize));
+                const gridY = Math.min(SIMILARITY_GRID_SIZE - 1, Math.floor(y / gridCellSize));
                 const gridIndex = gridY * SIMILARITY_GRID_SIZE + gridX;
                 lumaGrid[gridIndex] += lum;
                 gridCounts[gridIndex]++;
@@ -250,8 +375,8 @@
                 const center = y * SIMILARITY_CANVAS_SIZE + x;
                 const dx = Math.abs(luma[center + 1] - luma[center - 1]);
                 const dy = Math.abs(luma[center + SIMILARITY_CANVAS_SIZE] - luma[center - SIMILARITY_CANVAS_SIZE]);
-                const gridX = Math.min(SIMILARITY_GRID_SIZE - 1, Math.floor(x / (SIMILARITY_CANVAS_SIZE / SIMILARITY_GRID_SIZE)));
-                const gridY = Math.min(SIMILARITY_GRID_SIZE - 1, Math.floor(y / (SIMILARITY_CANVAS_SIZE / SIMILARITY_GRID_SIZE)));
+                const gridX = Math.min(SIMILARITY_GRID_SIZE - 1, Math.floor(x / gridCellSize));
+                const gridY = Math.min(SIMILARITY_GRID_SIZE - 1, Math.floor(y / gridCellSize));
                 edgeGrid[gridY * SIMILARITY_GRID_SIZE + gridX] += Math.sqrt(dx * dx + dy * dy);
             }
         }
@@ -280,27 +405,179 @@
         return dot / (Math.sqrt(normA) * Math.sqrt(normB));
     }
 
-    async function getStyleFeature(item) {
+    function readStyleFeatureFromDB(id) {
+        return new Promise(resolve => {
+            if (!db || !db.objectStoreNames.contains(SIMILARITY_FEATURE_STORE_NAME)) {
+                resolve(null);
+                return;
+            }
+            const transaction = db.transaction(SIMILARITY_FEATURE_STORE_NAME, 'readonly');
+            const store = transaction.objectStore(SIMILARITY_FEATURE_STORE_NAME);
+            const request = store.get(id);
+            request.onsuccess = () => {
+                const record = request.result;
+                if (record && record.version === SIMILARITY_FEATURE_VERSION && Array.isArray(record.feature)) {
+                    resolve(Float32Array.from(record.feature));
+                } else {
+                    resolve(null);
+                }
+            };
+            request.onerror = () => resolve(null);
+        });
+    }
+
+    function queueStyleFeatureSave(id, feature) {
+        if (!db || !db.objectStoreNames.contains(SIMILARITY_FEATURE_STORE_NAME)) return;
+        pendingSimilarityFeatureSaves.push({
+            id,
+            version: SIMILARITY_FEATURE_VERSION,
+            feature: Array.from(feature)
+        });
+
+        if (pendingSimilarityFeatureSaves.length >= 250) {
+            flushSimilarityFeatureSaves();
+        } else if (!pendingSimilarityFeatureSaveTimer) {
+            pendingSimilarityFeatureSaveTimer = setTimeout(flushSimilarityFeatureSaves, 1000);
+        }
+    }
+
+    function flushSimilarityFeatureSaves() {
+        if (pendingSimilarityFeatureSaveTimer) {
+            clearTimeout(pendingSimilarityFeatureSaveTimer);
+            pendingSimilarityFeatureSaveTimer = null;
+        }
+        if (!pendingSimilarityFeatureSaves.length || !db || !db.objectStoreNames.contains(SIMILARITY_FEATURE_STORE_NAME)) {
+            return Promise.resolve();
+        }
+        const records = pendingSimilarityFeatureSaves.splice(0, pendingSimilarityFeatureSaves.length);
+        return new Promise(resolve => {
+            const transaction = db.transaction(SIMILARITY_FEATURE_STORE_NAME, 'readwrite');
+            const store = transaction.objectStore(SIMILARITY_FEATURE_STORE_NAME);
+            records.forEach(record => store.put(record));
+            transaction.oncomplete = () => resolve();
+            transaction.onerror = () => resolve();
+            transaction.onabort = () => resolve();
+        });
+    }
+
+    async function getStyleFeature(item, token, signal) {
         if (similarityFeatureCache.has(item.id)) {
-            return similarityFeatureCache.get(item.id);
+            return { feature: similarityFeatureCache.get(item.id), source: 'memory' };
         }
 
-        const img = await loadImageForSimilarity(item.image, true);
-        const feature = extractImageFeature(img);
-        similarityFeatureCache.set(item.id, feature);
-        return feature;
+        throwIfSimilarityStopped(token, signal);
+        const dbFeature = await readStyleFeatureFromDB(item.id);
+        if (dbFeature) {
+            similarityFeatureCache.set(item.id, dbFeature);
+            return { feature: dbFeature, source: 'indexeddb' };
+        }
+
+        throwIfSimilarityStopped(token, signal);
+        const drawable = await loadImageForSimilarity(item.image, true, signal);
+        try {
+            throwIfSimilarityStopped(token, signal);
+            const feature = extractImageFeature(drawable);
+            similarityFeatureCache.set(item.id, feature);
+            queueStyleFeatureSave(item.id, feature);
+            return { feature, source: 'new' };
+        } finally {
+            closeDrawableForSimilarity(drawable);
+        }
+    }
+
+    function buildSimilarityItemsFromResults(rawResults) {
+        const threshold = getSimilarityThreshold();
+        const minimumScore = threshold / 100;
+        return rawResults
+            .filter(result => result.score >= minimumScore)
+            .sort((a, b) => b.score - a.score)
+            .map((result, index) => ({
+                ...result.item,
+                similarityScore: result.score,
+                similarityPercent: formatSimilarityPercent(result.score),
+                similarityRank: index + 1
+            }));
+    }
+
+    function updateSimilarityResultStatus(stats = similarityLastStats, customMessage = '') {
+        if (!stats) return;
+        const threshold = getSimilarityThreshold();
+        const filteredOut = Math.max(0, similarityAllResults.length - similarityItems.length);
+        const stoppedText = stats.stopped ? 'Stopped. ' : '';
+        const failedText = stats.failed > 0 ? ` · ${stats.failed.toLocaleString('en-US')} skipped` : '';
+        const filteredText = threshold > 0 ? ` · ${filteredOut.toLocaleString('en-US')} below ${threshold}% hidden` : '';
+        const cacheText = stats.cached > 0 ? ` · ${stats.cached.toLocaleString('en-US')} cached` : '';
+        const base = customMessage || `${stoppedText}Similar style results: ${similarityItems.length.toLocaleString('en-US')} shown / ${similarityAllResults.length.toLocaleString('en-US')} analyzed${failedText}${filteredText}${cacheText}.`;
+        setSimilarStyleStatus(base, false);
+    }
+
+    function applySimilarityThresholdAndRender(shouldRender = true) {
+        if (!similarityAllResults.length) return;
+        similarityItems = buildSimilarityItemsFromResults(similarityAllResults);
+        similarityModeActive = true;
+        styleCounter.innerHTML = `Similar Style Search: <span class="style-count-number">${similarityItems.length.toLocaleString('en-US')}</span>`;
+        updateSimilarityResultStatus();
+        updateControlsState();
+        if (shouldRender && currentView === 'gallery') {
+            renderView();
+        }
+    }
+
+    function commitSimilarityResults(rawResults, stats = {}, shouldRender = true) {
+        similarityAllResults = [...rawResults].sort((a, b) => b.score - a.score);
+        similarityLastStats = {
+            total: allItems.length,
+            processed: stats.processed || rawResults.length,
+            failed: stats.failed || 0,
+            cached: stats.cached || 0,
+            stopped: Boolean(stats.stopped)
+        };
+        similarityItems = buildSimilarityItemsFromResults(similarityAllResults);
+        similarityModeActive = true;
+        similaritySearchInProgress = false;
+        similarityStopRequested = false;
+        similarityAbortController = null;
+
+        if (similarStyleUploadBtn) similarStyleUploadBtn.disabled = false;
+        if (stopSimilarStyleBtn) {
+            stopSimilarStyleBtn.disabled = false;
+            stopSimilarStyleBtn.textContent = 'Stop';
+            stopSimilarStyleBtn.style.display = 'none';
+        }
+        if (clearSimilarStyleBtn) clearSimilarStyleBtn.style.display = 'inline-flex';
+
+        setSimilarityProgress(similarityLastStats.processed, similarityLastStats.total);
+        styleCounter.innerHTML = `Similar Style Search: <span class="style-count-number">${similarityItems.length.toLocaleString('en-US')}</span>`;
+        updateSimilarityResultStatus();
+        updateControlsState();
+        if (shouldRender && currentView === 'gallery') {
+            renderView();
+        }
     }
 
     function clearSimilaritySearch(shouldRender = true) {
         similarityAbortToken++;
+        similarityStopRequested = true;
+        if (similarityAbortController) {
+            similarityAbortController.abort();
+            similarityAbortController = null;
+        }
         similarityModeActive = false;
         similaritySearchInProgress = false;
         similarityItems = [];
+        similarityAllResults = [];
+        similarityLastStats = null;
         galleryContainer.classList.remove('similarity-view');
 
         if (similarStyleInput) similarStyleInput.value = '';
         if (clearSimilarStyleBtn) clearSimilarStyleBtn.style.display = 'none';
+        if (stopSimilarStyleBtn) {
+            stopSimilarStyleBtn.disabled = false;
+            stopSimilarStyleBtn.textContent = 'Stop';
+            stopSimilarStyleBtn.style.display = 'none';
+        }
         if (similarStyleUploadBtn) similarStyleUploadBtn.disabled = false;
+        setSimilarityProgress(0, 0);
         setSimilarStyleStatus('Upload an image to rank styles by visual similarity.', false);
 
         if (currentView === 'gallery') {
@@ -312,6 +589,19 @@
         }
     }
 
+    function stopSimilarStyleSearch() {
+        if (!similaritySearchInProgress) return;
+        similarityStopRequested = true;
+        if (similarityAbortController) {
+            similarityAbortController.abort();
+        }
+        if (stopSimilarStyleBtn) {
+            stopSimilarStyleBtn.disabled = true;
+            stopSimilarStyleBtn.textContent = 'Stopping...';
+        }
+        setSimilarStyleStatus('Stopping search... ranking already analyzed styles.', true);
+    }
+
     async function runSimilarStyleSearch(file) {
         if (!file) return;
         if (!file.type.startsWith('image/')) {
@@ -319,10 +609,19 @@
             return;
         }
 
+        if (similaritySearchInProgress) {
+            stopSimilarStyleSearch();
+        }
+
         const token = ++similarityAbortToken;
+        similarityAbortController = new AbortController();
+        const signal = similarityAbortController.signal;
+        similarityStopRequested = false;
         similarityModeActive = false;
         similaritySearchInProgress = true;
         similarityItems = [];
+        similarityAllResults = [];
+        similarityLastStats = null;
         startIndexOffset = 0;
         searchInput.value = '';
         searchTerm = '';
@@ -330,64 +629,115 @@
         clearSearchBtn.style.display = 'none';
         clearJumpBtn.style.display = 'none';
         if (clearSimilarStyleBtn) clearSimilarStyleBtn.style.display = 'inline-flex';
+        if (stopSimilarStyleBtn) {
+            stopSimilarStyleBtn.disabled = false;
+            stopSimilarStyleBtn.textContent = 'Stop';
+            stopSimilarStyleBtn.style.display = 'inline-flex';
+        }
         if (similarStyleUploadBtn) similarStyleUploadBtn.disabled = true;
+        setSimilarityProgress(0, allItems.length);
         setSimilarStyleStatus('Analyzing uploaded image...', true);
         updateControlsState();
 
         let objectUrl = null;
+        const results = [];
+        const stats = {
+            total: allItems.length,
+            processed: 0,
+            failed: 0,
+            cached: 0,
+            extracted: 0,
+            startedAt: performance.now(),
+            stopped: false
+        };
+
         try {
             objectUrl = URL.createObjectURL(file);
-            const queryImage = await loadImageForSimilarity(objectUrl, false);
-            const queryFeature = extractImageFeature(queryImage);
-            const results = [];
-            let failedCount = 0;
-
-            for (let i = 0; i < allItems.length; i += SIMILARITY_BATCH_SIZE) {
-                if (token !== similarityAbortToken) return;
-                const batch = allItems.slice(i, i + SIMILARITY_BATCH_SIZE);
-                const settled = await Promise.allSettled(batch.map(async item => {
-                    const feature = await getStyleFeature(item);
-                    return { item, score: cosineSimilarity(queryFeature, feature) };
-                }));
-
-                settled.forEach(result => {
-                    if (result.status === 'fulfilled') {
-                        results.push(result.value);
-                    } else {
-                        failedCount++;
-                    }
-                });
-
-                const processed = Math.min(i + SIMILARITY_BATCH_SIZE, allItems.length);
-                setSimilarStyleStatus(`Analyzing styles... ${processed.toLocaleString('en-US')} / ${allItems.length.toLocaleString('en-US')}`, true);
-                await new Promise(resolve => setTimeout(resolve, 0));
+            const queryImage = await loadImageForSimilarity(objectUrl, false, signal);
+            let queryFeature;
+            try {
+                queryFeature = extractImageFeature(queryImage);
+            } finally {
+                closeDrawableForSimilarity(queryImage);
             }
 
+            let nextIndex = 0;
+            let lastStatusUpdate = 0;
+            const total = allItems.length;
+            const workerCount = Math.min(getSimilarityConcurrency(), total);
+            const updateProgress = (force = false) => {
+                const now = performance.now();
+                if (!force && now - lastStatusUpdate < 140) return;
+                lastStatusUpdate = now;
+                setSimilarityProgress(stats.processed, total);
+                setSimilarStyleStatus(
+                    `Analyzing styles... ${stats.processed.toLocaleString('en-US')} / ${total.toLocaleString('en-US')} · ${formatSimilarityRate(stats.processed, stats.startedAt)} · parallel ${workerCount}`,
+                    true
+                );
+            };
+
+            async function similarityWorker() {
+                while (token === similarityAbortToken && !similarityStopRequested) {
+                    const index = nextIndex++;
+                    if (index >= total) break;
+                    const item = allItems[index];
+                    try {
+                        const { feature, source } = await getStyleFeature(item, token, signal);
+                        throwIfSimilarityStopped(token, signal);
+                        const score = cosineSimilarity(queryFeature, feature);
+                        results.push({ item, score });
+                        if (source === 'memory' || source === 'indexeddb') {
+                            stats.cached++;
+                        } else {
+                            stats.extracted++;
+                        }
+                    } catch (error) {
+                        if (!similarityStopRequested && token === similarityAbortToken && error?.name !== 'AbortError') {
+                            stats.failed++;
+                        }
+                    } finally {
+                        stats.processed++;
+                        updateProgress(false);
+                        if (stats.processed % 96 === 0) {
+                            await new Promise(resolve => setTimeout(resolve, 0));
+                        }
+                    }
+                }
+            }
+
+            await Promise.all(Array.from({ length: workerCount }, () => similarityWorker()));
+            await flushSimilarityFeatureSaves();
+
             if (token !== similarityAbortToken) return;
+            stats.stopped = similarityStopRequested;
+
             if (results.length === 0) {
                 throw new Error('No preview images could be analyzed. If you are running locally, try serving the folder with a local web server instead of opening index.html directly.');
             }
 
-            results.sort((a, b) => b.score - a.score);
-            similarityItems = results.map((result, index) => ({
-                ...result.item,
-                similarityScore: result.score,
-                similarityRank: index + 1
-            }));
-            similarityModeActive = true;
-            similaritySearchInProgress = false;
-            if (similarStyleUploadBtn) similarStyleUploadBtn.disabled = false;
-
-            const failedText = failedCount > 0 ? ` (${failedCount.toLocaleString('en-US')} previews skipped)` : '';
-            setSimilarStyleStatus(`Similar style results ready: ${similarityItems.length.toLocaleString('en-US')} styles${failedText}.`, false);
-            styleCounter.innerHTML = `Similar Style Search: <span class="style-count-number">${similarityItems.length.toLocaleString('en-US')}</span>`;
-            renderView();
+            updateProgress(true);
+            commitSimilarityResults(results, stats, true);
         } catch (error) {
+            if (token !== similarityAbortToken) return;
+            if (similarityStopRequested && results.length > 0) {
+                stats.stopped = true;
+                commitSimilarityResults(results, stats, true);
+                return;
+            }
             console.error('Similar Style Search failed:', error);
             similarityModeActive = false;
             similaritySearchInProgress = false;
             similarityItems = [];
+            similarityAllResults = [];
+            similarityLastStats = null;
+            similarityAbortController = null;
             if (similarStyleUploadBtn) similarStyleUploadBtn.disabled = false;
+            if (stopSimilarStyleBtn) {
+                stopSimilarStyleBtn.disabled = false;
+                stopSimilarStyleBtn.textContent = 'Stop';
+                stopSimilarStyleBtn.style.display = 'none';
+            }
+            setSimilarityProgress(0, 0);
             setSimilarStyleStatus(error.message || 'Similar Style Search failed.', false);
             showToast('Similar Style Search failed.');
             updateControlsState();
@@ -476,7 +826,7 @@
             ? `<div class="uniqueness-rank" title="Uniqueness Rank">#${item.uniquenessRank}</div>`
             : '';
         const similarityHTML = typeof item.similarityScore === 'number'
-            ? `<div class="similarity-score" title="Visual similarity rank and score">#${item.similarityRank} · ${Math.round(item.similarityScore * 100)}%</div>`
+            ? `<div class="similarity-score" title="Visual similarity rank and score">#${item.similarityRank} · ${item.similarityPercent || formatSimilarityPercent(item.similarityScore)}</div>`
             : '';
 
         let favButtonHTML;
@@ -677,7 +1027,7 @@
                 const p = document.createElement('p');
                 p.style.textAlign = 'center';
                 p.style.gridColumn = '1 / -1';
-                p.innerText = 'No similar style results are available.';
+                p.innerText = `No similar style results are available at the current ${getSimilarityThreshold()}% threshold.`;
                 galleryContainer.appendChild(p);
                 return;
             }
@@ -966,6 +1316,8 @@
         swipeLaunchControls.classList.toggle('disabled', isSearchingByName || isJumpingByCount || isSimilarityLocked);
         if (getRandomStyleBtn) getRandomStyleBtn.disabled = similaritySearchInProgress;
         if (copyRandomStyleBtn) copyRandomStyleBtn.disabled = similaritySearchInProgress;
+        if (similarStyleThresholdInput) similarStyleThresholdInput.disabled = false;
+        if (similarStyleConcurrencyInput) similarStyleConcurrencyInput.disabled = similaritySearchInProgress;
     }
 
     function updateJumpToArtistHint() {
@@ -1336,8 +1688,25 @@
         });
     }
 
+    if (stopSimilarStyleBtn) {
+        stopSimilarStyleBtn.addEventListener('click', stopSimilarStyleSearch);
+    }
+
     if (clearSimilarStyleBtn) {
         clearSimilarStyleBtn.addEventListener('click', () => clearSimilaritySearch(true));
+    }
+
+    if (similarStyleThresholdInput) {
+        similarStyleThresholdInput.addEventListener('input', () => {
+            getSimilarityThreshold();
+            if (similarityModeActive && !similaritySearchInProgress) {
+                applySimilarityThresholdAndRender(true);
+            }
+        });
+    }
+
+    if (similarStyleConcurrencyInput) {
+        similarStyleConcurrencyInput.addEventListener('change', getSimilarityConcurrency);
     }
 
     // Обработка ввода в строке поиска
